@@ -31,10 +31,11 @@ remains in Interface. Display DPI and the existing text/control size setting sti
 
 | Page | Contents |
 |---|---|
-| Display | Fullscreen, window dimensions, picture shape, filter, VSync, render scale; widescreen HUD/cutscene/side-fill/FOV options; brightness, game brightness curve and vignette |
+| Display | Fullscreen, window dimensions, picture shape, filter, VSync, render scale, anti-aliasing (MSAA), game texture levels, anisotropic filtering; widescreen HUD/cutscene/side-fill/FOV options; brightness, game brightness curve, vignette, colour tint and film scratches |
 | Controls | Players/devices and live stick/button feedback, rumble test, keyboard player, startup controller count/backend, dead zones, thresholds, rumble and pointer behavior; expand Gamepad button mapping or Keyboard and mouse bindings for Detect/Add/Clear/Default |
-| Mods | Local texture packs, enablement and priority; Earlier/Later changes precedence, with later selected packs winning; Refresh packs, Open Mods Folder, Memory and manual pack list |
+| Mods | Installed local/project packs, enablement and overlap winners; shared Load Order window; verified project catalogue downloads/updates, rollback and removal; Refresh local mods, Open Mods Folder, Memory and manual pack list |
 | Interface | Launcher skip, startup movies, overlay key/pad chord, text/control size |
+| Cheats | Fight cheats (infinite health, max Blazin', no health regeneration, giant/tiny fighters), the Story fighter swap and, in-game, the Story profile one-shots (cash, development points, fighting styles) |
 | Diagnostics | Recorder/capture/retention settings, texture authoring, save-affecting unlock tools and, in-game, Story scenes and EA's developer menu |
 | Maintenance | Data/save/mod/install/settings/play-log paths with Open and Copy path; setup selection, reset settings, version and licenses |
 
@@ -46,12 +47,30 @@ pane follows the focused or hovered setting. Existing INI names and saved values
 
 ### Texture packs
 
-Mods lists selected packs first, including missing selections, then other local folders. Inventory checks
-the `manifest.ini` header; the texture loader validates image entries. Unchecking removes a pack from
-the active list and keeps its files. Later enabled packs take priority. Changes and memory budgets apply
-at the next launch. Lists exceeding the existing 95-byte string payload limit are rejected with a message.
-Texture capture is in Diagnostics. Home's HD switch is unavailable until at least one selected local pack
-has a supported manifest, but an already enabled switch can always be turned off.
+Mods lists selected packs first, including missing selections, then other local folders. The origin badge
+distinguishes manually installed packs from catalogue-managed downloads. Refresh local mods finds new
+folders without enabling them. Unchecking keeps files. **Load Order...** shows all enabled local and
+project packs together: highest priority at the top. Higher/Lower moves a pack;
+the overlap readout names which final pack wins the same texture ID. Changes apply on the next launch.
+Place HD Widescreen Menus above the optional Recomp HD baseline in the priority window. The advanced pack-list field and
+`RECOMP_TEXTURE_PACKS` environment locks remain available; overly long lists are rejected visibly.
+
+The **Project catalogue** uses a separate Python helper for network operations. Refresh verifies the
+signed catalogue; Install and Update verify archive size/hash and layout, then switch complete pack
+folders with recoverable rollback. Installed updates retain the same stable folder and load order.
+Installation does not enable a pack. Updates are your choice. A missing/expired catalogue never blocks
+offline Play; expired metadata cannot authorize new installs. Incompatible or revoked versions cannot
+be newly installed. **Restore previous version** retains one intact managed version. Disable a mod
+before **Remove download**; local folders and edited managed files are never silently overwritten.
+
+Catalogue mutation is launcher-only. During a helper job Play is disabled; Cancel keeps the prior
+installation unless its short final commit has already completed. An OS-held lock also protects games
+started without the launcher. An interrupted commit is recovered before Play; if recovery cannot safely
+recognize files, it preserves them and offers Retry recovery. A saved skip-launcher preference is
+bypassed for recovery without changing the preference. Old installations without the helper keep local
+mod controls and Play. The signed project catalogue provides compatible reviewed downloads.
+For authoring, see [Texture Modding — Getting Started](texture-modding-getting-started.md);
+for helper behavior, see [mod management](mod-manager.md).
 
 ### Folders, logs and setup
 
@@ -71,6 +90,21 @@ release and operation in the wizard. New installed wrappers supply installation/
 setup is prefilled. In the overlay, Maintenance directs you to close the game and return to the launcher
 before updating. A missing or moved setup can be selected again.
 
+### Cheats
+
+The **Cheats** page (`[cheats]` in `settings.ini`, all off by default) has two kinds of cheat:
+
+- **Fight cheats** apply as you change them, in every mode, and are never saved: infinite health and max
+  Blazin' (for player 1, every player or everyone), no health regeneration, and giant or tiny fighters.
+  Max Blazin' fills the meter five seconds into a fight; start Blazin' as usual. Infinite health keeps
+  you standing, but a fight with a time limit is still decided on points when the clock runs out.
+- **Play Story fights as** swaps your created fighter for another fighter, with their look and moves, in
+  Story fights only. Cutscenes, the crib and the shops still show your own fighter, and nothing is saved.
+- **Story profile** one-shots, in the overlay while you play Story: **Max cash** ($999,999), **Max
+  development points** (99,999) and **Change fighting styles** (a main style and up to two hybrids). These
+  write into the Story profile, and the game saves it: the change is permanent. Each asks first; copy your
+  save folder (Maintenance, Saves) before using them.
+
 ### Developer options
 
 Diagnostics contains **Unlock all fighters and venues** (`[debug] unlock_all`, off by default).
@@ -81,7 +115,7 @@ See [unlocking everything](research/unlock-everything.md).
 
 Interface contains **Skip startup movies and legal screen**, preserving `[debug] skip_intro` and its
 default off. It starts at Press Start after resource loading; Story scenes and idle attract playback
-remain. `RECOMP_SKIP_INTRO` overrides it for a run. See [startup skipping](research/startup-skip-setting.md).
+remain. `RECOMP_SKIP_INTRO` overrides it for a run. See [startup skipping](research/startup-skip-flow.md#recordertoolkit-integration-and-historical-v0101-acceptance).
 
 ## In-game overlay
 
@@ -90,10 +124,11 @@ it; Esc/B also closes it when no popup or binding capture is open. The game sees
 while the overlay is open, but **keeps running**; it does not pause. On a Mac keyboard use fn+F1 if F1 is
 the brightness key, or change the shortcut in Interface. The pointer shows while the overlay is open.
 
-Fullscreen, window size, 4:3/stretch, filter, VSync, brightness and vignette apply live. Widescreen,
-render scale, brightness curve and other startup settings apply at the next launch; the footer lists
-pending changes. Settings in the launcher say **on Play** instead. Widescreen transitions into or out of
-a wide canvas are tracked separately from the two live picture shapes.
+Fullscreen, window size, 4:3/stretch, filter, VSync, texture levels, anisotropic filtering, brightness,
+vignette, colour tint and film scratches apply live. Widescreen, render scale, anti-aliasing, the brightness
+curve and other startup settings apply at the next launch; the footer lists pending changes. Settings in
+the launcher say **on Play** instead. Widescreen transitions into or out of a wide canvas are tracked
+separately from the two live picture shapes.
 
 ## Keyboard and gamepad
 
@@ -120,7 +155,7 @@ Off-by-default test hooks:
 |---|---|
 | `RECOMP_WINDOW_SHOT=<file.bmp>` | Read back the launcher or overlay window to a 32-bit BMP; macOS/Linux |
 | `RECOMP_WINDOW_SHOT_FRAME` | Overlay frame to capture, default 20 |
-| `RECOMP_LAUNCHER_SCRIPT` | `<ms>:click:<x>:<y>`, `move`, `resize:<width>:<height>`, `shot:<file>`, `ui:<target>`, `play`, `quit`, separated by semicolons; positions in window points |
+| `RECOMP_LAUNCHER_SCRIPT` | `<ms>:click:<x>:<y>`, `move`, `resize:<width>:<height>`, `shot:<file>`, `ui:<target>`, `uiopt:<target>` (as `ui`, silent if absent), `play`, `quit`, separated by semicolons; positions in window points |
 | `RECOMP_HOST_SCRIPT` | Game window: `<ms>:key:<SDL name>`, `click`, `move`, `text`; times from opening |
 | `RECOMP_INPUT_VIRTUAL_PADS`, `RECOMP_INPUT_VIRTUAL_CHORD_MS` | SDL virtual pad tests, including overlay stick-click/B paths ([input guide](10-input.md)) |
 

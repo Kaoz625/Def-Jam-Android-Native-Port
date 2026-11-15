@@ -21,7 +21,7 @@ DRIVER = r'''
 #include <stdlib.h>
 #include "recomp/gen/recomp_types.h"
 #include "pc_ui.h"
-unsigned char memory[8192];
+unsigned char memory[0x3A0000]; /* covers DEBUG_FLAG (0x39C1DA): MSVC if-converts the guarded store */
 uint32_t g_eax = 0x1234, g_ecx = 0x100, g_edx = 0x5678, g_esp = 0x1000;
 static int boot_calls;
 static int audio_calls;
@@ -29,6 +29,8 @@ static int unlock_calls;
 void defjam_skip_intro_enter(void);
 void defjam_unlock_all_on_funccall(const char *text);
 recomp_func_t recomp_lookup(uint32_t va) { (void)va; return 0; }
+void cheats_start_game(uint32_t gamedata) { (void)gamedata; }  /* src/patches/cheats.c */
+void cheats_start_game_done(uint32_t gamedata) { (void)gamedata; }
 void sub_000158F0(void) { unlock_calls++; g_esp += 4; }
 void sub_00055640(void)
 {

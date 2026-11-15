@@ -6,7 +6,6 @@ session loads only what it needs.
 
 | File | Read it when |
 |---|---|
-| [launcher-handoff.md](launcher-handoff.md) | you are continuing the launcher redesign in PR #58 |
 | `triage.md` | a run, a regression row or a smoke test failed or looks wrong |
 | `diagnostics.md` | the digest does not explain a stop; the table of watch/trace tools and the three rules |
 | `playtest.md` | the owner reports a fault seen in play, or hands you a bug bundle |
@@ -14,6 +13,7 @@ session loads only what it needs.
 | `lifter-overrides.md` | you are about to write or change something in `src/recomp_manual.c` |
 | `delegation.md` | you are considering a sub-agent |
 | `environment.md` | a build or a shell behaves oddly |
+| `release.md` | you are queueing a PR for a release, or cutting a release (release trains) |
 
 `skills/<name>/SKILL.md` and `briefs/<name>.md` are the single sources for the per-tool copies
 (`.claude/skills`, `.codex/skills`, `.claude/agents`). Edit these, then run

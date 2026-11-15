@@ -565,6 +565,71 @@ static void recorder_frame_done(double present_ms, double capture_ms)
     recorder_frame_end(&in);
 }
 
+#if defined(_WIN32)
+/* Windows only: the refresh rate is read through Win32, and the presenter that
+ * paces frames (d3d8_present.c) is the Direct3D 11 one. */
+
+/* The refresh rate of the display the window is on, 0 when unknown. Whole
+ * hertz, as the presenter reads it: a 59.94 Hz mode reads 59. */
+static unsigned window_refresh_hz(void)
+{
+    MONITORINFOEXW mi;
+    DEVMODEW mode;
+    if (!s_window)
+        return 0;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    memset(&mode, 0, sizeof mode);
+    mode.dmSize = sizeof mode;
+    if (!GetMonitorInfoW(MonitorFromWindow(s_window, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&mi) ||
+        !EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &mode))
+        return 0;
+    return (unsigned)mode.dmDisplayFrequency;
+}
+
+/* One log line when the display's refresh rate, the window mode or who paces
+ * the frames changes, read about once a second. Whether vsync paces the game
+ * depends on the refresh rate (a multiple of 60 Hz) as well as the setting, and
+ * a 60 fps game on a 75, 144 or 165 Hz display shows its frames for an uneven
+ * number of refreshes, which looks choppy while the frame counter says 60
+ * (issue #67). Without this line a log cannot tell that case apart. */
+static void log_display_pacing(void)
+{
+    extern int d3d8_present_sync_interval(void);
+    extern int d3d8_present_display_paced(void);
+    static unsigned countdown, last_hz = ~0u;
+    static int last_interval = -2, last_fullscreen = -1, last_paced = -1;
+    unsigned hz;
+    int interval, paced, vsync;
+
+    if (countdown) {
+        countdown--;
+        return;
+    }
+    countdown = 60;
+    hz = window_refresh_hz();
+    interval = d3d8_present_sync_interval();
+    paced = d3d8_present_display_paced();
+    if (hz == last_hz && interval == last_interval && s_fullscreen == last_fullscreen && paced == last_paced)
+        return;
+    last_hz = hz;
+    last_interval = interval;
+    last_fullscreen = s_fullscreen;
+    last_paced = paced;
+    vsync = pc_display("vsync", 1);
+    if (paced)
+        fprintf(stderr, "[DISPLAY] refresh %u Hz, %s, vsync on: the display paces frames "
+                        "(sync interval %d)\n",
+                hz, s_fullscreen ? "full screen" : "windowed", interval);
+    else
+        fprintf(stderr, "[DISPLAY] refresh %u Hz, %s, vsync %s: the game's 60 fps timer paces frames%s\n",
+                hz, s_fullscreen ? "full screen" : "windowed", vsync ? "on" : "off",
+                !vsync ? ""
+                : hz ? " (refresh is not a multiple of 60 Hz; motion can judder)"
+                     : " (refresh rate unknown)");
+}
+#endif /* _WIN32 */
+
 /* Put the frame on screen.
  *
  * pgraph_d3d11_flush() submits whatever geometry was still batched and counts
@@ -589,7 +654,9 @@ void d3d11_translator_frame_end(void)
             capture_ms = recorder_capture(dev);
             present_at = recorder_now_ms();
         }
+        { extern void input_latency_present(int before); input_latency_present(1); }
         dev->lpVtbl->Present(dev, NULL, NULL, NULL, NULL);
+        { extern void input_latency_present(int before); input_latency_present(0); }
         if (recording)
             recorder_frame_done(recorder_now_ms() - present_at, capture_ms);
         /* While the display paces the presents (display.vsync on a 60, 120,
@@ -602,6 +669,9 @@ void d3d11_translator_frame_end(void)
             extern void xbox_Nv2aSetFlipHz(int hz);
             xbox_Nv2aSetFlipHz(d3d8_present_display_paced() ? 63 : 0);
         }
+#if defined(_WIN32)
+        log_display_pacing();
+#endif
     }
     d3d11_translator_pump();
     d3d11_translator_report();

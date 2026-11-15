@@ -5,7 +5,11 @@ No game is run here; the routes themselves are exercised by scripts/regress.py.
 import importlib.util
 import json
 import os
+from pathlib import Path
 import pytest
+import subprocess
+import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -202,6 +206,17 @@ def test_save_guard_restores_userdata_caches_and_original_absence(tmp_path, monk
     assert guard.restored_equal and not (absent / 'save').exists()
 
 
+def test_save_copy_is_independent_and_falls_back_if_clone_is_unavailable(tmp_path, monkeypatch):
+    src, dst = tmp_path/'source', tmp_path/'copy'
+    src.write_bytes(b'original')
+    harness.copy_save_file(str(src), str(dst))
+    dst.write_bytes(b'modified')
+    assert src.read_bytes() == b'original'  # A hard link would corrupt the protected save.
+    monkeypatch.setattr(harness, '_clone_save_file', lambda *_: False)
+    harness.copy_save_file(str(src), str(dst))
+    assert dst.read_bytes() == b'original'
+
+
 def test_runs_unlock_everything_unless_told_otherwise():
     assert harness.unlock_default({})["RECOMP_UNLOCK_ALL"] == "1"
     assert harness.unlock_default({"RECOMP_UNLOCK_ALL": "0"})["RECOMP_UNLOCK_ALL"] == "0"
@@ -259,6 +274,92 @@ def test_backup_status_never_overwrites_save_content_or_prunes_failed_restore(tm
         with harness.SaveGuard(str(tmp_path)):
             pass
     assert harness.Path(failed.copy).is_dir()
+
+
+def _interrupted_guard(tmp_path, monkeypatch):
+    """A guard whose run was killed after the game changed the save."""
+    monkeypatch.setattr(harness, 'kill_stray', lambda: None)
+    save = tmp_path / 'save'
+    (save / 'UserData').mkdir(parents=True)
+    (save / 'UserData/profile').write_bytes(b'original')
+    guard = harness.SaveGuard(str(tmp_path))
+    guard.__enter__()
+    (save / 'UserData/profile').write_bytes(b'changed by the killed run')
+    monkeypatch.setattr(harness, 'pid_alive', lambda pid: False)     # the harness process is gone
+    return save, guard
+
+
+def test_a_killed_guard_blocks_the_next_one_instead_of_copying_the_changed_save(tmp_path, monkeypatch):
+    save, killed = _interrupted_guard(tmp_path, monkeypatch)
+    with pytest.raises(harness.StaleSaveGuard, match='save-recover'):
+        harness.SaveGuard(str(tmp_path)).__enter__()
+    assert (save / 'UserData/profile').read_bytes() == b'changed by the killed run'
+    assert harness.Path(killed.copy, 'UserData/profile').read_bytes() == b'original'
+
+
+def test_save_recover_restore_puts_the_oldest_copy_back(tmp_path, monkeypatch):
+    save, killed = _interrupted_guard(tmp_path, monkeypatch)
+    monkeypatch.setenv('DEFJAM_DATA', str(tmp_path))
+    assert harness.main(['save-recover']) == 1                     # lists, changes nothing
+    assert (save / 'UserData/profile').read_bytes() == b'changed by the killed run'
+    assert harness.main(['save-recover', '--restore']) == 0
+    assert (save / 'UserData/profile').read_bytes() == b'original'
+    with harness.SaveGuard(str(tmp_path)) as guard:                # runs again, and the copy can be pruned
+        pass
+    assert guard.restored_equal
+    assert (tmp_path / 'save-guard/.status' / (harness.Path(killed.backup).name + '.ok')).is_file()
+
+
+def test_save_recover_accept_keeps_the_save_as_it_is(tmp_path, monkeypatch):
+    save, killed = _interrupted_guard(tmp_path, monkeypatch)
+    monkeypatch.setenv('DEFJAM_DATA', str(tmp_path))
+    assert harness.main(['save-recover', '--accept']) == 0
+    assert (save / 'UserData/profile').read_bytes() == b'changed by the killed run'
+    with harness.SaveGuard(str(tmp_path)):
+        pass
+
+
+def test_a_killed_guard_that_changed_nothing_does_not_block(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'kill_stray', lambda: None)
+    (tmp_path / 'save').mkdir()
+    (tmp_path / 'save/profile').write_bytes(b'original')
+    killed = harness.SaveGuard(str(tmp_path))
+    killed.__enter__()                                             # e.g. a launcher check: the game wrote nothing
+    monkeypatch.setattr(harness, 'pid_alive', lambda pid: False)
+    with harness.SaveGuard(str(tmp_path)) as guard:
+        pass
+    assert guard.restored_equal
+    assert (tmp_path / 'save-guard/.status' / (harness.Path(killed.backup).name + '.ok')).is_file()
+
+
+def test_a_guard_that_is_still_running_blocks_a_new_one_and_is_never_settled(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'kill_stray', lambda: None)
+    (tmp_path / 'save').mkdir()
+    running = harness.SaveGuard(str(tmp_path))
+    running.__enter__()                                            # our own pid: alive
+    root = str(tmp_path / 'save-guard')
+    assert harness.unresolved_guards(root) == [(harness.Path(running.backup).name, 'running')]
+    with pytest.raises(harness.StaleSaveGuard, match='still doing so'):
+        harness.SaveGuard(str(tmp_path)).__enter__()
+    assert harness.resolve_guards(str(tmp_path), 'accept') == [harness.Path(running.backup).name]
+    monkeypatch.setenv('DEFJAM_DATA', str(tmp_path))
+    assert harness.main(['save-recover', '--restore']) == 3        # a wrapper waits on this
+    running.__exit__(None, None, None)
+    assert running.restored_equal and harness.unresolved_guards(root) == []
+
+
+@pytest.mark.skipif(not hasattr(harness.signal, 'SIGTERM') or sys.platform == 'win32', reason='POSIX signals')
+def test_termination_unwinds_through_the_guard_so_the_save_is_restored(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, 'kill_stray', lambda: None)
+    (tmp_path / 'save').mkdir()
+    (tmp_path / 'save/profile').write_bytes(b'original')
+    with pytest.raises(SystemExit):
+        with harness.SaveGuard(str(tmp_path)) as guard:
+            (tmp_path / 'save/profile').write_bytes(b'changed')
+            os.kill(os.getpid(), harness.signal.SIGTERM)
+            time.sleep(1)
+    assert guard.restored_equal
+    assert (tmp_path / 'save/profile').read_bytes() == b'original'
 
 
 @pytest.mark.parametrize('fault', ['crashes', 'watchdogs', 'debug_layer', 'truncated', 'icall_failures', 'unimplemented'])
@@ -350,7 +451,7 @@ def test_launch_failure_restores_full_save_root(tmp_path, monkeypatch, original)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'original')
     monkeypatch.setattr(harness, 'kill_stray', lambda: None)
-    monkeypatch.setattr(harness.pipeline_state, 'verify_build', lambda *a: None)
+    monkeypatch.setattr(harness.pipeline_state, 'verify_build', lambda *a, **k: None)
     repo = tmp_path / 'repo'
     monkeypatch.setattr(harness, 'REPO', str(repo))
     for name in ('build/%s/%s' % (harness.RELEASE_PRESET, harness.EXE_NAME), 'game/default.xbe'):
@@ -518,3 +619,79 @@ def test_a_failed_run_points_at_the_triage_digest(capsys):
     out = capsys.readouterr().out
     assert 'FAIL' in out
     assert 'triage   python scripts/triage.py logs/run-20261014-101500.log.err' in out
+
+
+@pytest.mark.parametrize('change', ['commands', 'interpreter', 'tool data', 'key version'])
+def test_analysis_key_covers_commands_interpreter_tool_data_and_version(tmp_path, monkeypatch, change):
+    # An Update reuses certified analysis, so every input that can change its output is keyed.
+    repo, toolkit = pipeline_fixture(tmp_path)
+    pipeline.verify_analysis(repo, toolkit)
+    if change == 'commands':
+        monkeypatch.setattr(pipeline, 'ANALYSIS_COMMANDS', pipeline.ANALYSIS_COMMANDS[:-1])
+    elif change == 'interpreter':
+        real = pipeline.interpreter()
+        monkeypatch.setattr(pipeline, 'interpreter', lambda python=None: {
+            **real, 'packages': {**real['packages'], 'capstone': '0.0.synthetic'}})
+    elif change == 'tool data':
+        data = toolkit / 'tools/recomp/data/win32_api_names.txt'
+        data.parent.mkdir(parents=True)
+        data.write_text('SyntheticApi\n')
+    else:
+        monkeypatch.setattr(pipeline, 'KEY_VERSION', pipeline.KEY_VERSION + 1)
+    with pytest.raises(ValueError, match='Analysis is stale'):
+        pipeline.verify_analysis(repo, toolkit)
+
+
+def test_a_finished_build_can_be_checked_from_another_python(tmp_path, monkeypatch):
+    # A Steam Deck analyzes and builds in the container and runs the harness on SteamOS's Python:
+    # RECORDED accepts the interpreter the analysis recorded and still checks everything else.
+    repo, toolkit = pipeline_fixture(tmp_path)
+    real = pipeline.interpreter()
+    monkeypatch.setattr(pipeline, 'interpreter', lambda python=None: {**real, 'python': '3.99 (another host)'})
+    with pytest.raises(ValueError, match=r'Analysis is stale \(interpreter changed\)'):
+        pipeline.verify_analysis(repo, toolkit)
+    pipeline.verify_analysis(repo, toolkit, python=pipeline.RECORDED)
+    monkeypatch.setattr(pipeline, 'KEY_VERSION', pipeline.KEY_VERSION + 1)
+    with pytest.raises(ValueError, match=r'Analysis is stale \(key changed\)'):
+        pipeline.verify_analysis(repo, toolkit, python=pipeline.RECORDED)
+
+
+def test_interpreter_action_reports_what_the_engine_compares(tmp_path):
+    script = os.path.join(ROOT, 'scripts', 'pipeline-state.py')
+    reported = json.loads(subprocess.check_output([sys.executable, str(script), 'interpreter'], text=True))
+    assert reported == pipeline.interpreter()
+    assert set(reported['packages']) == set(pipeline.ANALYSIS_PACKAGES)
+    with pytest.raises(ValueError, match='analysis interpreter'):
+        pipeline.interpreter(tmp_path / 'missing-python')
+
+
+def test_analyze_runs_the_keyed_commands_and_certifies_them(tmp_path, monkeypatch):
+    repo, toolkit = pipeline_fixture(tmp_path)
+    (toolkit / 'game_files/defjam-analysis-state.json').unlink()
+    ran = []
+
+    def run(argv, cwd=None, **kwargs):
+        ran.append(argv[1:])
+        assert Path(cwd) == toolkit
+        return subprocess.CompletedProcess(argv, 0)
+    monkeypatch.setattr(pipeline.subprocess, 'run', run)
+    pipeline.analyze(repo, toolkit)
+    seeds = str(repo / 'config/seed_functions.json')
+    assert [a for a in ran if '--seed-functions' in a][0][-2:] == ['--seed-functions', seeds]
+    assert len(ran) == len(pipeline.ANALYSIS_COMMANDS)
+    pipeline.verify_analysis(repo, toolkit)
+
+
+def test_lift_records_its_options_in_the_key(tmp_path, monkeypatch):
+    repo, toolkit = pipeline_fixture(tmp_path)
+
+    def translate(argv, cwd=None, check=False):
+        staged = Path(argv[argv.index('--gen-dir') + 1])
+        (staged / 'recomp_0000.c').write_text('// new generated set')
+        (staged / 'recomp_dispatch.c').write_text('// dispatcher')
+    monkeypatch.setattr(pipeline.subprocess, 'run', translate)
+    pipeline.lift(repo, toolkit, 500, ['--no-inline'])
+    state = pipeline.read_state(repo / 'src/recomp/gen/lift-state.json')
+    assert state['inputs']['options'] == {'split': 500, 'extra': ['--no-inline']}
+    assert state['inputs']['key'] == pipeline.KEY_VERSION
+    pipeline.verify_lift(repo, toolkit)

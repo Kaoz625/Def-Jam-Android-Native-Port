@@ -59,6 +59,7 @@
 #include "nv2a/nv2a_pgraph_d3d11.h"
 #include "hooks/save_compat.h"
 #include "hooks/recorder.h"
+#include "hooks/pc_language.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -607,6 +608,9 @@ static int host_main(void)
      * behind two writers doing single-character system calls. */
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     setvbuf(stderr, NULL, _IOFBF, 1 << 16);
+    { extern void input_latency_start(void); input_latency_start(); }
+    { extern void input_consumption_start(void); input_consumption_start(); }
+    { extern void input_late_start(void); input_late_start(); }
 
     /* Find the game folder, open a log if nothing captures the output, supply
      * the runtime's required switches and load settings.ini -- before anything
@@ -636,6 +640,8 @@ static int host_main(void)
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
+    /* A language pack's change to the data sections (an embedded texture or string). */
+    pc_language_patch_xbe(xbe_data, xbe_size);
 
     /* Report the audio codec as present, before the layout is built.
      *
@@ -657,6 +663,23 @@ static int host_main(void)
     /* Preserve this title's six-speaker balance when using the newer toolkit. */
     if (!getenv("RECOMP_APU_MIXDOWN"))
         _putenv_s("RECOMP_APU_MIXDOWN", "six");
+    /* Toolkit v0.16 renders 3D voices through HRTF by default (as xemu does).
+     * Off for this title until a listening comparison says otherwise (D147):
+     * a new default stays off for the migration's acceptance, as with v0.13
+     * (D76). RECOMP_APU_HRTF=1 turns it on. */
+    if (!getenv("RECOMP_APU_HRTF"))
+        _putenv_s("RECOMP_APU_HRTF", "0");
+#ifdef _WIN32
+    /* XAudio2 queue: 6 x 512-sample buffers (64 ms, the depth v0.10.x had)
+     * instead of the toolkit's 4 x 512 (43 ms, D199). In borderless full
+     * screen each Present waits for the display, the queue then drops to its
+     * low mark, and the pacer renders ahead in a burst that overtakes the
+     * title's own stream writes: the opening scene clicked all through with 4
+     * (381-400 holes in 330 s of the mix buffer) and is clean with 6 (5), as
+     * in a window. RECOMP_AUDIO_BUF_COUNT overrides it; SDL3 hosts keep theirs. */
+    if (!getenv("RECOMP_AUDIO_BUF_COUNT"))
+        _putenv_s("RECOMP_AUDIO_BUF_COUNT", "6");
+#endif
 
     /* Acknowledge the audio DSP's command doorbell.
      *
