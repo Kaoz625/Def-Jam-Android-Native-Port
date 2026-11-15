@@ -1081,6 +1081,47 @@ static void trace_voice_render(void)
     }
 }
 
+/* [android] contatg 1.4's rollback hooks (scripts/android-rollback131.py patched these five
+ * into the generated C, checked against the bodies its lifter made). The 1.1.2 lifter makes
+ * different text, so they are entry hooks and one wrapper here instead: each was inserted at
+ * the function's entry label, which nothing jumps back to, so running first is the same.
+ * Outside Android they do nothing. */
+void sub_0002C530_enter(void)
+{
+#if defined(__ANDROID__)
+    extern void netplay_on_update(void); netplay_on_update();
+#endif
+}
+void sub_0003C6E0_enter(void)
+{
+#if defined(__ANDROID__)
+    extern void rollback_audio_init_begin(void); rollback_audio_init_begin();
+#endif
+}
+void sub_00012CC0_enter(void)
+{
+#if defined(__ANDROID__)
+    extern void rollback_audio_init_end(void); rollback_audio_init_end();
+#endif
+}
+void sub_0010AC20_enter(void)
+{
+#if defined(__ANDROID__)
+    extern void rollback_note_dynamic_load(uint32_t,uint32_t); rollback_note_dynamic_load(MEM32(g_esp),g_ecx);
+#endif
+}
+/* The heap allocator: rollback may serve the allocation itself (it then returns as the
+ * function would have, as the patched body's early return did). */
+extern void sub_00029500_gen(void);
+void sub_00029500(void)
+{
+#if defined(__ANDROID__)
+    extern int rollback_route_alloc(void);
+    if (rollback_route_alloc()) return;
+#endif
+    sub_00029500_gen();
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     if (xbox_va == 0x000766B0u)
