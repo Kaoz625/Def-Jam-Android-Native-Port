@@ -1,3 +1,5 @@
+#include "platform/android_hitch.h"
+#include "platform/android_power25.h"
 /*
  * Read-only survey of the pushbuffer a title submits.
  *
@@ -47,10 +49,14 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+#if defined(__ANDROID__)
+extern int nv2a_pb_exec_index_packet(uint32_t subch, uint32_t method,
+                                   const uint32_t *params, uint32_t count);
+#endif
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
-static void note(uint32_t subch, uint32_t method)
+static void note_many(uint32_t subch, uint32_t method, uint32_t count)
 {
     /* Called for every parameter word in the stream, so the entry is found by
      * index, not by walking the table: with a few hundred distinct methods
@@ -59,7 +65,7 @@ static void note(uint32_t subch, uint32_t method)
     static uint16_t slot[8][0x800];
     uint16_t *at = &slot[subch & 7u][(method >> 2) & 0x7FFu];
     if (*at) {
-        s_seen[*at - 1].count++;
+        s_seen[*at - 1].count += count;
         return;
     }
     if (s_seen_count < PB_MAX_METHODS)
@@ -78,10 +84,12 @@ static void note(uint32_t subch, uint32_t method)
     if (s_seen_count < PB_MAX_METHODS) {
         s_seen[s_seen_count].method = method;
         s_seen[s_seen_count].subch  = subch;
-        s_seen[s_seen_count].count  = 1;
+        s_seen[s_seen_count].count  = count;
         s_seen_count++;
     }
 }
+
+static void note(uint32_t subch, uint32_t method) { note_many(subch, method, 1); }
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
  * decide what a translator has to implement, and a bare method number does not
@@ -296,6 +304,36 @@ volatile uint32_t g_pb_live_va;
  * read, for the prefetch model (xbox_Nv2aReleasePump). */
 volatile uint32_t g_pb_words;
 
+/* Only non-increasing index packets, with every available parameter inside
+ * both PUT and the contiguous mapping. State-changing methods, fences,
+ * software methods and subchannel changes keep the scalar walker. */
+static uint32_t pb_index_packet(uint32_t subch, uint32_t method, int noninc,
+                                uint32_t va, uint32_t end_va, uint32_t count)
+{
+#if defined(__ANDROID__)
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *fast = getenv("RECOMP_CPU_FAST");
+        enabled = !fast || strcmp(fast, "0");
+    }
+    if (!enabled || !s_exec_enabled || !noninc || subch != 0
+            || (method != 0x1800u && method != 0x1808u)
+            || va < XBOX_CONTIG_BASE || va >= XBOX_CONTIG_BASE + XBOX_CONTIG_WINDOW
+            || (va & 3u) || end_va <= va) return 0;
+    uint32_t available = (end_va - va) / 4;
+    if (count > available) count = available;
+    if (count < 4 || (uint64_t)va + (uint64_t)count * 4
+            > (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_WINDOW) return 0;
+    const uint32_t *params = (const uint32_t *)((uintptr_t)xbox_GetMemoryOffset() + va);
+    if (!nv2a_pb_exec_index_packet(subch, method, params, count)) return 0;
+    note_many(subch, method, count);
+    return count;
+#else
+    (void)subch; (void)method; (void)noninc; (void)va; (void)end_va; (void)count;
+    return 0;
+#endif
+}
+
 static uint32_t pb_segment(uint32_t va, uint32_t end_va, uint32_t *jump_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -309,6 +347,9 @@ static uint32_t pb_segment(uint32_t va, uint32_t end_va, uint32_t *jump_va)
         if (va != s_pend.va) {
             s_pend.count = 0;                   /* the walk moved elsewhere */
         } else {
+            uint32_t consumed = pb_index_packet(s_pend.subch, s_pend.method,
+                                                s_pend.noninc, va, end_va, s_pend.count);
+            va += consumed * 4; words += consumed; s_pend.count -= consumed;
             while (s_pend.count && va != end_va) {
                 note(s_pend.subch, s_pend.method);
                 if (s_exec_enabled)
@@ -394,8 +435,9 @@ static uint32_t pb_segment(uint32_t va, uint32_t end_va, uint32_t *jump_va)
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            uint32_t i;
-            for (i = 0; i < count && va != end_va; i++) {
+            uint32_t i = pb_index_packet(subch, method, noninc, va, end_va, count);
+            va += i * 4; words += i;
+            for (; i < count && va != end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
@@ -484,6 +526,7 @@ static int pb_enabled(void)
 
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
+    DJ_SCOPE22(DJ_PARSE22);
     uint32_t jump;
 
     if (!pb_enabled() || end_va <= start_va)
@@ -507,12 +550,14 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
  * method (see nv2a_pb_stall); otherwise it ran to PUT, or as far as it could. */
 uint32_t nv2a_pb_run(uint32_t get_va, uint32_t put_va, int *stalled)
 {
+    DJ_SCOPE22(DJ_PARSE22);
     uint32_t va = get_va, jump;
     int hops = 0;
 
     *stalled = 0;
     if (!pb_enabled() || get_va == put_va)
         return put_va;
+    defjam_power25_work_begin();
     {
         unsigned i = s_runs_n++ & 7u;
         s_runs[i].from = get_va; s_runs[i].put = put_va; s_runs[i].stop = 0;

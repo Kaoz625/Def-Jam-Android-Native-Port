@@ -30,8 +30,19 @@
 #define _GNU_SOURCE   /* sched_setaffinity, CPU_SET */
 #endif
 #include <sched.h>
+#if defined(__ANDROID__)
+#include "android_guest_cores.h"
+#include "platform/android_perf.h"
 #endif
+#endif
+#include "platform/android_hitch.h"
 #include "kernel.h"
+#if defined(__ANDROID__)
+#include "platform/android_thread_policy.h"
+#endif
+#if defined(__ANDROID__)
+#include "android_gpu_wait.h"
+#endif
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
@@ -402,6 +413,20 @@ static long kernel_log_budget(void)
     return budget;
 }
 
+/* Full read tracing is a bring-up tool, not a production setting. On Android
+ * stderr is a file on shared storage; formatting and flushing thousands of
+ * 8 KiB streaming reads stole time from the single guest CPU and caused audio
+ * underruns. Keep early reads and every failure, with an opt-in for the rest. */
+static int io_trace_enabled(void)
+{
+    static int value = -1;
+    if (value < 0) {
+        const char *env = getenv("RECOMP_IO_TRACE");
+        value = env && *env && strcmp(env, "0") && strcmp(env, "off");
+    }
+    return value;
+}
+
 #define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget())
 /* Some sites logged at a tighter cap than the rest; keep them proportional. */
 #define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= kernel_log_budget() / 2)
@@ -462,7 +487,7 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top;
+    uint32_t ctx1, ctx2, stack_top, guest_entry;
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -524,32 +549,74 @@ void xbox_PinToGuestCore(void)
     /* The same rule through the scheduler: every guest thread on one CPU the
      * process is allowed to use, CPU 2 when it is one of them. */
     static volatile LONG init;
+#if !defined(__ANDROID__)
     static int cpu = -1;
+#endif
+#if defined(__ANDROID__)
+    static cpu_set_t guest_set;
+    static int guest_count;
+#endif
     cpu_set_t set;
 
     if (InterlockedCompareExchange(&init, 1, 0) == 0) {
         const char *s = getenv("RECOMP_GUEST_CORES");
+#if defined(__ANDROID__)
+        if (sched_getaffinity(0, sizeof set, &set) == 0) {
+            guest_count = defjam_android_guest_select(s, &set, &guest_set, sizeof set);
+            fprintf(stderr, "  [KERNEL] Android guest affinity: %d allowed CPU(s), request=%s\n",
+                    guest_count, s ? s : "1");
+        }
+#else
         if (!(s && !strcmp(s, "all")) && sched_getaffinity(0, sizeof set, &set) == 0) {
             int i;
+            /* Android conventionally numbers the little cluster first and
+             * the performance cores last (the Adreno 610 test phone exposed
+             * its big cores this way). CPU 2, chosen for desktop Linux, put
+             * the entire single-core Xbox workload on a little core. Keep
+             * the console's one-core ordering, but select the highest allowed
+             * Android CPU; the OS can still constrain the process affinity. */
+#if defined(__ANDROID__)
+            for (i = CPU_SETSIZE - 1; i >= 0 && cpu < 0; i--)
+                if (CPU_ISSET(i, &set))
+                    cpu = i;
+#else
             if (CPU_ISSET(2, &set))
                 cpu = 2;
             else
                 for (i = 0; i < CPU_SETSIZE && cpu < 0; i++)
                     if (CPU_ISSET(i, &set))
                         cpu = i;
+#endif
             if (cpu >= 0)
                 fprintf(stderr, "  [KERNEL] guest threads share host CPU %d"
                                 " (RECOMP_GUEST_CORES=all to spread them)\n", cpu);
         }
+#endif
         InterlockedExchange(&init, 2);
     }
     while (init != 2)
         YieldProcessor();
+#if defined(__ANDROID__)
+    if (guest_count > 0) {
+        static volatile LONG noted;
+        cpu_set_t applied;
+        int result = defjam_android_guest_affinity_apply(&guest_set, sizeof guest_set);
+        if (result != 0)
+            fprintf(stderr, "  [KERNEL] Android guest affinity request rejected by scheduler\n");
+        if (InterlockedCompareExchange(&noted, 1, 0) == 0) {
+            extern void defjam_android_note_guest_cores(int count);
+            int count = sched_getaffinity(0, sizeof applied, &applied) == 0 ? CPU_COUNT(&applied) : 0;
+            defjam_android_note_guest_cores(count);
+            fprintf(stderr, "  [KERNEL] Android guest affinity applied: %d CPU(s), scheduler result=%d\n", count, result);
+        }
+    }
+#else
     if (cpu >= 0) {
         CPU_ZERO(&set);
         CPU_SET(cpu, &set);
         sched_setaffinity(0, sizeof set, &set);
     }
+#endif
 #else
     /* Darwin on Apple Silicon has no thread affinity. The same rule is kept
      * with a token instead: one joined thread runs at a time, and a waiting
@@ -578,6 +645,7 @@ void xbox_PinToGuestCore(void)
 #endif
 }
 
+
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
@@ -585,6 +653,10 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
 
     xbox_PinToGuestCore();
+#if defined(__ANDROID__)
+    defjam_android_guest_thread_note("guest-worker", "bridge_thread_main",
+            (uintptr_t)fn, s->guest_entry, GetCurrentThreadId());
+#endif
 #if !defined(_WIN32)
     guest_turn_note_start((const void *)fn, ctx1);
 #endif
@@ -622,13 +694,14 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top, uint32_t guest_entry)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->guest_entry = guest_entry;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
@@ -741,7 +814,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top, start_routine);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -3151,6 +3224,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     /* It runs interrupt and deferred routines, which on the console preempt
      * the title on its one CPU rather than running beside it. */
     xbox_PinToGuestCore();
+#if defined(__ANDROID__)
+    defjam_android_guest_thread_note("guest-irq", "kernel_timer_thread",
+            (uintptr_t)kernel_timer_thread, 0, GetCurrentThreadId());
+#endif
     /* Preempt, not share: a title thread spinning at raised priority on the
      * one guest CPU -- Direct3D waiting for a fence -- otherwise starves the
      * very DPC whose acknowledgement lets the GPU reach that fence. It sleeps
@@ -3652,6 +3729,16 @@ static NTSTATUS bridge_create_file_impl(
 
     memset(&ios, 0, sizeof(ios));
 
+#if defined(__ANDROID__)
+    /* Optional game-owned, read-only menu override. Generic toolkit builds
+     * retain the original NtCreateFile path when no game callback is linked. */
+    extern void *defjam_android_menu_open(const char *, uint32_t, uint32_t, uint32_t)
+        __attribute__((weak));
+    if (defjam_android_menu_open &&
+        (h = defjam_android_menu_open(name.Buffer, access, disposition, options))) {
+        st = STATUS_SUCCESS; ios.Status = st; ios.Information = 1;
+    } else
+#endif
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                            file_attrs, share, disposition, options);
 
@@ -3806,6 +3893,10 @@ static void bridge_NtCreateFile(void)
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
+#if defined(__ANDROID__)
+        extern int xbox_android_path_cached_missing(void);
+        if(g_eax&&xbox_android_path_cached_missing()&&(g_eax==0xC0000034u||g_eax==0xC000003Au))return;
+#endif
         if (g_eax)
             fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
                     g_eax, _e,
@@ -4122,41 +4213,46 @@ static void bridge_NtReadFile(void)
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */
     {
+        static unsigned read_log_count;
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
+        int log_read = (uint32_t)ios.Status != 0 || read_log_count < 24 || io_trace_enabled();
         /* The offset matters as much as the length. A title streaming a pack
          * file reads sector-aligned chunks, so the first bytes belong to
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         char line[160];
-        if (poff)
-            snprintf(line, sizeof line, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
-                    (long long)off.QuadPart, length, got,
-                    (uint32_t)ios.Status,
-                    got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
-        else
-            snprintf(line, sizeof line, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X  h=%08X\n",
-                    g_xbox_kernel_caller,
-                    length, got, (uint32_t)ios.Status,
-                    got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
-                    got > 2 ? p[2] : 0, got > 3 ? p[3] : 0, STACK_ARG(0));
-        /* Written without the guest CPU: a scene load reads thousands of chunks,
-         * and with the log busy (the push-buffer thread writes to it too) a
-         * write that waited kept every guest thread, the audio writer among
-         * them, waiting as well. The line is formatted first, so nothing of the
-         * title's is read while another thread runs. */
-        {
+        if (log_read) {
+            read_log_count++;
+            if (poff)
+                snprintf(line, sizeof line, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                        g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
+                        (long long)off.QuadPart, length, got,
+                        (uint32_t)ios.Status,
+                        got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
+                        got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+            else
+                snprintf(line, sizeof line, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X  h=%08X\n",
+                        g_xbox_kernel_caller,
+                        length, got, (uint32_t)ios.Status,
+                        got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
+                        got > 2 ? p[2] : 0, got > 3 ? p[3] : 0, STACK_ARG(0));
+            /* Written without the guest CPU: a scene load reads thousands of chunks,
+             * and with the log busy (the push-buffer thread writes to it too) a
+             * write that waited kept every guest thread, the audio writer among
+             * them, waiting as well. The line is formatted first, so nothing of the
+             * title's is read while another thread runs. */
+            {
 #if !defined(_WIN32)
-            int left = guest_turn_leave();
+                int left = guest_turn_leave();
 #endif
-            fputs(line, stderr);
-            fflush(stderr);
+                fputs(line, stderr);
+                fflush(stderr);
 #if !defined(_WIN32)
-            guest_turn_return(left);
+                guest_turn_return(left);
 #endif
+            }
         }
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
@@ -8822,7 +8918,7 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top, start_routine);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }
@@ -10483,7 +10579,12 @@ static void kernel_gpu_preempt(void)
         }
         if (g_timer_wake)
             SetEvent(g_timer_wake);
+#if defined(__ANDROID__)
+        android_gpu_wait_pause((uint64_t)(t1.QuadPart - t0.QuadPart)
+                               * 1000000000ull / (uint64_t)f.QuadPart);
+#else
         SwitchToThread();
+#endif
         waited = 1;
     }
     if (waited) {
@@ -10558,9 +10659,21 @@ static void kernel_thunk_dispatch_body(void)
 
     {
         static DWORD last_summary_tick = 0;
-        DWORD now = GetTickCount();
+        DWORD now = last_summary_tick;
+#if defined(__ANDROID__)
+        /* This clock is only for diagnostic summaries, not guest time or
+         * scheduling. Keep counting every ordinal but sample its deadline. */
+        if (last_summary_tick == 0 || (g_kernel_call_count & 255) == 0)
+#endif
+            now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+        if (now - last_summary_tick >=
+#if defined(__ANDROID__)
+            10000
+#else
+            2000
+#endif
+            && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
 #if !defined(_WIN32) && !defined(__linux__)
@@ -10640,8 +10753,43 @@ static void kernel_thunk_dispatch_body(void)
         }
     }
 
+#if defined(__ANDROID__)
+    int bootstrap127=ordinal==255 && g_thread_mode==XBOX_THREAD_MODE_INLINE && g_thread_call_count==0;
+    DefjamKernelProbe probe={0,0,-1,-1};
+    if(!bootstrap127&&defjam_kernel_profile_mode)probe=defjam_perf_begin(ordinal);
+#endif
+    unsigned hitch123=0;
+#if defined(__ANDROID__)
+    unsigned category123=DJ_KERNEL;
+    switch(ordinal){
+    case 66:case 75:case 190:case 195:case 198:case 202:case 207:case 210:case 211:case 218:case 219:case 220:case 226:case 236:case 237:category123=DJ_FILE;break;
+    case 99:case 151:case 153:case 158:case 159:case 230:case 233:case 234:case 235:case 238:case 277:case 294:case 221:category123=DJ_SYNC;break;
+    case 14:case 15:case 17:case 165:case 166:case 167:case 171:case 184:case 199:category123=DJ_ALLOC;break;
+    }
+    /* The inline bootstrap enters the entire game's main loop and may never
+     * return. It is guest execution, not one giant ordinal255 kernel call. */
+    if(bootstrap127)category123=DJ_UNSCOPED;
+    hitch123=dj_trace(category123);
+    /* Raw arguments only: never dereference an untrusted guest object merely
+     * for profiling. For99 this is interval VA,158/235 array VA, otherwise arg0. */
+    uint32_t key125=ordinal==99?STACK_ARG(2):(ordinal==158||ordinal==235)?STACK_ARG(1):g_slot_arg_bytes[slot]>=4?STACK_ARG(0):0;
+    uint64_t kernel125=!bootstrap127&&defjam_kernel_trace_begin?defjam_kernel_trace_begin(ordinal,key125,g_xbox_kernel_caller):0;
+
+#endif
     if (bridge) {
+#if defined(__ANDROID__)
+        /* Direct hot calls allow compiler inlining without skipping dispatch,
+         * ownership, waits, interrupts, tracing or stdcall cleanup. */
+        switch(ordinal) {
+        case 277: if(bridge==bridge_RtlEnterCriticalSection)bridge_RtlEnterCriticalSection();else bridge();break;
+        case 294: if(bridge==bridge_RtlLeaveCriticalSection)bridge_RtlLeaveCriticalSection();else bridge();break;
+        case 221: if(bridge==bridge_NtReleaseMutant)bridge_NtReleaseMutant();else bridge();break;
+        case 234: if(bridge==bridge_NtWaitForSingleObjectEx)bridge_NtWaitForSingleObjectEx();else bridge();break;
+        default:bridge();break;
+        }
+#else
         bridge();
+#endif
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than
          * gating on g_kernel_call_count: a missing bridge is rare and is
@@ -10669,6 +10817,14 @@ static void kernel_thunk_dispatch_body(void)
         }
         g_eax = 0;
     }
+
+#if defined(__ANDROID__)
+    if(defjam_kernel_trace_end)defjam_kernel_trace_end(kernel125);
+#endif
+    dj_trace_end(hitch123);
+#if defined(__ANDROID__)
+    if(!bootstrap127&&defjam_kernel_profile_mode)defjam_perf_end(probe);
+#endif
 
     /* Clean stdcall args from the simulated stack.
      * On real x86, stdcall callee does "ret N" to pop the return address

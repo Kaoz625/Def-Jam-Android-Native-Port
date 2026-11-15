@@ -18,6 +18,7 @@
 #define timeEndPeriod(ms)   ((void)0)
 #endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "input_host.h"
@@ -80,6 +81,18 @@ static struct Host {
     int found;                      /* pads opened at start */
     int sdl;                        /* SDL is the pad backend */
 } H;
+
+#if defined(__ANDROID__)
+#include "android_touch_axes.h"
+void xbox_HostInputTouchSticks(int lx,int ly,int rx,int ry){
+    if(!H.running||!InterlockedCompareExchange(&H.focused,0,0)||InterlockedCompareExchange(&H.ui_active,0,0))android_touch_set(0,0,0,0);
+    else android_touch_set(lx,ly,rx,ry);
+}
+static int host_touch_merge(XBOX_INPUT_STATE *state){
+    if(!InterlockedCompareExchange(&H.focused,0,0)||InterlockedCompareExchange(&H.ui_active,0,0))return 0;
+    return android_touch_merge(state);
+}
+#endif
 
 void xbox_HostInputDefaults(InputHostConfig *cfg)
 {
@@ -668,6 +681,12 @@ static DWORD WINAPI reader_thread(LPVOID unused)
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
         if (SDL_Init(SDL_INIT_GAMEPAD)) {
             H.sdl = 1;
+#if defined(__ANDROID__)
+            {
+                int loaded = SDL_AddGamepadMappingsFromFile("gamecontrollerdb.txt");
+                if (loaded >= 0) fprintf(stderr, "[INPUT] loaded %d custom gamepad mappings\n", loaded);
+            }
+#endif
 #if !defined(_WIN32)
             SDL_AddEventWatch(pad_watch, NULL);
 #endif
@@ -833,6 +852,9 @@ int xbox_HostInputStart(const InputHostConfig *cfg)
 
 void xbox_HostInputStop(void)
 {
+#if defined(__ANDROID__)
+    android_touch_reset();
+#endif
     if (!H.running) return;
     H.running = 0;
     SetEvent(H.stop);
@@ -911,6 +933,9 @@ void xbox_HostInputScriptVirtual(int slot, const uint8_t *held)
 void xbox_HostInputSetUiActive(int active)
 {
     InterlockedExchange(&H.ui_active, active ? 1 : 0);
+#if defined(__ANDROID__)
+    if(active)android_touch_set(0,0,0,0);
+#endif
 }
 
 void xbox_HostInputRumbleTest(int slot)
@@ -941,7 +966,61 @@ void xbox_HostInputScriptControls(const uint8_t *held)
     LeaveCriticalSection(&H.cs);
 }
 
-int xbox_HostInputPlayerCount(void) { return H.players < 1 ? 1 : H.players; }
+#if defined(__GNUC__) || defined(__clang__)
+#define NP_READ(x) __atomic_load_n(&(x),__ATOMIC_ACQUIRE)
+#define NP_WRITE(x,v) __atomic_store_n(&(x),(v),__ATOMIC_RELEASE)
+#else
+#define NP_READ(x) (x)
+#define NP_WRITE(x,v) ((x)=(v))
+#endif
+/* Online play (xbox_HostInputSetNetplay, xbox_HostInputSetNetplayMulti). */
+static volatile LONG g_np_on;
+static volatile LONG g_np_local, g_np_remote_mask;
+static volatile LONG g_np_fight_suppress;   /* xbox_HostInputSetNetplayFight */
+static DWORD (*volatile g_np_remote_state)(XBOX_INPUT_STATE *state);
+static DWORD (*volatile g_np_remote_slot_state)(int slot, XBOX_INPUT_STATE *state);
+
+void xbox_HostInputSetNetplayMulti(int enable, int local_slot, unsigned remote_mask,
+                                   DWORD (*remote)(int slot, XBOX_INPUT_STATE *state))
+{
+    InterlockedExchange(&g_np_on, 0);
+    remote_mask &= (1u << SLOTS) - 1u;
+    if (!enable || local_slot < 0 || local_slot >= SLOTS || !remote_mask || (remote_mask & (1u << local_slot)))
+        return;
+    NP_WRITE(g_np_local,local_slot);
+    NP_WRITE(g_np_remote_mask,(LONG)remote_mask);
+    NP_WRITE(g_np_remote_state,NULL);
+    NP_WRITE(g_np_remote_slot_state,remote);
+    InterlockedExchange(&g_np_on, 1);
+}
+
+void xbox_HostInputSetNetplay(int enable, int local_slot, int remote_slot,
+                              DWORD (*remote)(XBOX_INPUT_STATE *state))
+{
+    InterlockedExchange(&g_np_on, 0);
+    if (!enable || local_slot < 0 || local_slot >= SLOTS || remote_slot < 0 || remote_slot >= SLOTS ||
+        local_slot == remote_slot)
+        return;
+    NP_WRITE(g_np_local,local_slot);
+    NP_WRITE(g_np_remote_mask,(LONG)(1u << remote_slot));
+    NP_WRITE(g_np_remote_slot_state,NULL);
+    NP_WRITE(g_np_remote_state,remote);
+    InterlockedExchange(&g_np_on, 1);
+}
+
+void xbox_HostInputSetNetplayFight(WORD suppress_buttons)
+{
+    InterlockedExchange(&g_np_fight_suppress, (LONG)suppress_buttons);
+}
+
+int xbox_HostInputPlayerCount(void)
+{
+    int n = H.players < 1 ? 1 : H.players, s, online = 1;
+    if (!NP_READ(g_np_on)) return n;
+    for (s = 0; s < SLOTS; s++)
+        if (NP_READ(g_np_remote_mask) & (1 << s)) online++;
+    return n < online ? online : n;
+}
 int xbox_HostInputKeyboardSlot(void) { return H.kb_slot; }
 
 void xbox_HostInputKey(int code, int down)
@@ -959,15 +1038,82 @@ void xbox_HostInputFocus(int focused)
 {
     InterlockedExchange(&H.focused, focused ? 1 : 0);
     if (!focused) memset(H.key, 0, sizeof(H.key));
+#if defined(__ANDROID__)
+    if(!focused)android_touch_set(0,0,0,0);
+#endif
+}
+
+/* Every device on this PC is the one local player: pads in whatever slot they took (one
+ * switched on after the game started lands after the keyboard) and the keyboard. Buttons
+ * are combined, analog buttons take the strongest, each stick the one pushed furthest. */
+DWORD xbox_HostInputGetLocalState(XBOX_INPUT_STATE *state)
+{
+    int s, present = 0;
+    DWORD packet = 0;
+    if (!H.running || !state) return ERROR_DEVICE_NOT_CONNECTED;
+    memset(state, 0, sizeof(*state));
+    EnterCriticalSection(&H.cs);
+    for (s = 0; s < SLOTS; s++) {
+        XBOX_INPUT_STATE one;
+        int i;
+        if (!(H.slot[s].device >= 0 || s == H.kb_slot || (H.kb_merge && s == 0)))
+            continue;
+        to_state(&H.out[s], &one, H.packet[s]);
+        present = 1;
+        packet += H.packet[s];
+        state->Gamepad.wButtons |= one.Gamepad.wButtons;
+        for (i = 0; i < 8; i++)
+            if (one.Gamepad.bAnalogButtons[i] > state->Gamepad.bAnalogButtons[i])
+                state->Gamepad.bAnalogButtons[i] = one.Gamepad.bAnalogButtons[i];
+        if (abs(one.Gamepad.sThumbLX) + abs(one.Gamepad.sThumbLY) >
+            abs(state->Gamepad.sThumbLX) + abs(state->Gamepad.sThumbLY)) {
+            state->Gamepad.sThumbLX = one.Gamepad.sThumbLX;
+            state->Gamepad.sThumbLY = one.Gamepad.sThumbLY;
+        }
+        if (abs(one.Gamepad.sThumbRX) + abs(one.Gamepad.sThumbRY) >
+            abs(state->Gamepad.sThumbRX) + abs(state->Gamepad.sThumbRY)) {
+            state->Gamepad.sThumbRX = one.Gamepad.sThumbRX;
+            state->Gamepad.sThumbRY = one.Gamepad.sThumbRY;
+        }
+    }
+    state->dwPacketNumber = packet;
+#if defined(__ANDROID__)
+    present|=host_touch_merge(state);
+#endif
+    LeaveCriticalSection(&H.cs);
+    return present ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 DWORD xbox_HostInputGetState(int slot, XBOX_INPUT_STATE *state)
 {
     int present;
     if (!H.running || slot < 0 || slot >= SLOTS || !state) return ERROR_DEVICE_NOT_CONNECTED;
+    if (NP_READ(g_np_on)) {
+        DWORD (*remote)(XBOX_INPUT_STATE *) = NP_READ(g_np_remote_state);
+        DWORD (*remote_slot)(int, XBOX_INPUT_STATE *) = NP_READ(g_np_remote_slot_state);
+        WORD suppress = (WORD)NP_READ(g_np_fight_suppress);
+        DWORD r = ERROR_DEVICE_NOT_CONNECTED;
+        if (slot == NP_READ(g_np_local))
+            r = xbox_HostInputGetLocalState(state);
+        else if (NP_READ(g_np_remote_mask) & (1 << slot)) {
+            if (remote_slot) r = remote_slot(slot, state);
+            else if (remote) r = remote(state);
+        }
+        if (suppress) {             /* a lockstep fight: see xbox_HostInputSetNetplayFight */
+            if (r != ERROR_SUCCESS) {
+                memset(state, 0, sizeof(*state));
+                r = ERROR_SUCCESS;
+            }
+            state->Gamepad.wButtons &= (WORD)~suppress;
+        }
+        return r;
+    }
     EnterCriticalSection(&H.cs);
     present = H.slot[slot].device >= 0 || slot == H.kb_slot || (H.kb_merge && slot == 0);
     if (present) to_state(&H.out[slot], state, H.packet[slot]);
+#if defined(__ANDROID__)
+    if(slot==0){if(!present)memset(state,0,sizeof(*state));present|=host_touch_merge(state);}
+#endif
     LeaveCriticalSection(&H.cs);
     return present ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
@@ -975,6 +1121,7 @@ DWORD xbox_HostInputGetState(int slot, XBOX_INPUT_STATE *state)
 DWORD xbox_HostInputRumble(int slot, WORD low, WORD high)
 {
     if (!H.running || slot < 0 || slot >= SLOTS) return ERROR_DEVICE_NOT_CONNECTED;
+    if (NP_READ(g_np_on)) { if (slot != NP_READ(g_np_local)) return ERROR_SUCCESS; slot = 0; }
     EnterCriticalSection(&H.cs);
     H.slot[slot].low = low;
     H.slot[slot].high = high;

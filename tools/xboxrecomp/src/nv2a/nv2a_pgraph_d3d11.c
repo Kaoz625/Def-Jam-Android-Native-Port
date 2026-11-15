@@ -532,6 +532,16 @@ static void submit_draw(void)
  * Method Handler
  * ══════════════════════════════════════════════════════════════════════ */
 
+#if defined(__ANDROID__)
+void pgraph_d3d11_note_index_words(uint32_t words)
+{
+    if (g_pg.initialized) {
+        g_pg.stats.methods_handled += words;
+        g_pg.stats.methods_ignored += words;
+    }
+}
+#endif
+
 int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 {
     if (!g_pg.initialized)
@@ -1202,8 +1212,26 @@ void pgraph_d3d11_set_frame_end_callback(void (*callback)(void))
 {
     s_frame_end_callback = callback;
 }
+extern uint64_t g_pf_gather_ns, g_pf_draw_ns, g_pf_batches;
+extern uint64_t defjam_pf_now(void);
 void pgraph_d3d11_frame_end(void)
 {
+    /* DEFJAM_V5 */
+    {
+        static unsigned pf_n;
+        static uint64_t pf_prev;
+        uint64_t now = defjam_pf_now();
+        if (!pf_prev) pf_prev = now;
+        if (++pf_n >= 240) {
+            double fr = (double)pf_n;
+            fprintf(stderr, "[PERF] %u frames: %.2f ms/frame wall, %.2f ms gather+pack, "
+                            "%.2f ms draw-submit, %.0f batches/frame%c",
+                    pf_n, (double)(now - pf_prev) / 1e6 / fr, (double)g_pf_gather_ns / 1e6 / fr,
+                    (double)g_pf_draw_ns / 1e6 / fr, (double)g_pf_batches / fr, 10);
+            pf_n = 0; pf_prev = now;
+            g_pf_gather_ns = g_pf_draw_ns = g_pf_batches = 0;
+        }
+    }
     pgraph_d3d11_flush();
     if (s_frame_end_callback)
         s_frame_end_callback();

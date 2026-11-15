@@ -19,6 +19,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "platform/android_hitch.h"
 #include "apu_state.h"
 #ifndef _WIN32
 #include <unistd.h>
@@ -641,6 +642,10 @@ int64_t  g_apu_trap_stall_us;
 
 static void *mcpx_apu_frame_thread(void *arg)
 {
+#if defined(__ANDROID__)
+    extern void defjam_android_native_thread_enter(const char *,const char *,uintptr_t);
+    defjam_android_native_thread_enter("audio-mix","mcpx_apu_frame_thread",(uintptr_t)mcpx_apu_frame_thread);
+#endif
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
 #if defined(__APPLE__)
     /* Guest threads run at user-interactive QoS on Darwin (win32_compat.c, so the title's
@@ -664,6 +669,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
+        unsigned audio123=dj_trace(DJ_AUDIO);
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
          * whatever the front end is doing. Tying it to se_frame stopped it
@@ -744,6 +750,7 @@ static void *mcpx_apu_frame_thread(void *arg)
                 gave_up = 0;
             } else if (!gave_up && xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF &&
                        !g_test_tone.active) {
+                unsigned trap123=dj_trace(DJ_SYNC);
                 int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME), waited_us = 0;
 
                 while ((fectl & NV_PAPU_FECTL_FEMETHMODE) && waited_us < 20000 &&
@@ -769,6 +776,7 @@ static void *mcpx_apu_frame_thread(void *arg)
                 g_apu_trap_stalls = ++stalls;
                 g_apu_trap_expired = expired;
                 g_apu_trap_stall_us += waited_us;
+                dj_trace_end(trap123);
                 xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                     NV_PAPU_SECTL_XCNTMODE);
                 apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
@@ -805,6 +813,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * thread starved there indefinitely: Burnout 3 froze on its vehicle
          * select, blocked in voice_lock at raised IRQL, which in turn held
          * off every USB interrupt. */
+        dj_trace_end(audio123);
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);

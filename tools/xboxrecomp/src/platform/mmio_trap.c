@@ -47,6 +47,21 @@ static volatile int     g_trap_count;
 static volatile int     g_installed;
 static volatile uint64_t g_neighbours;
 static struct sigaction g_prev_segv, g_prev_bus;
+static mmio_write_watch_fn g_write_watch131;
+static int install(void);
+int mmio_write_watch_handle131(void *address,void *context){
+    int saved=errno;mmio_write_watch_fn watch=__atomic_load_n(&g_write_watch131,__ATOMIC_ACQUIRE);
+    int handled=watch&&watch(address,context);errno=saved;return handled;
+}
+int mmio_write_watch_claim(mmio_write_watch_fn handler){
+    if(!handler)return -1;
+    mmio_write_watch_fn expected=NULL;
+    if(!__atomic_compare_exchange_n(&g_write_watch131,&expected,handler,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)&&expected!=handler)return -1;
+    return install();
+}
+void mmio_write_watch_release(mmio_write_watch_fn handler){
+    __atomic_compare_exchange_n(&g_write_watch131,&handler,NULL,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+}
 
 uint64_t mmio_trap_neighbour_count(void) { return g_neighbours; }
 
@@ -436,6 +451,9 @@ static void chain(const struct sigaction *prev, int sig, siginfo_t *si, void *ct
 static void on_fault(int sig, siginfo_t *si, void *ctx)
 {
     int saved = errno;
+    if(sig==SIGSEGV && si && si->si_code==SEGV_ACCERR && mmio_write_watch_handle131(si->si_addr,ctx)){
+        errno=saved;return;
+    }
 
     if (!service((ucontext_t *)ctx, (uintptr_t)si->si_addr, 1))
         chain(sig == SIGBUS ? &g_prev_bus : &g_prev_segv, sig, si, ctx);

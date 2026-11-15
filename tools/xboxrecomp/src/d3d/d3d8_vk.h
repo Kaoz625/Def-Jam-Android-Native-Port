@@ -37,6 +37,12 @@ typedef struct D3D8VkHost {
 
 void d3d8_vk_set_host(const D3D8VkHost *host);
 
+#if defined(__ANDROID__)
+/* Creates an Android Vulkan surface using the loader selected by the renderer
+ * (system or custom Turnip). native_window is ANativeWindow*. */
+int d3d8_vk_android_create_surface(void *instance, void *native_window, void *surface);
+#endif
+
 /* A host program's drawing on top of the picture, in window pixels, after the
  * title's target has been scaled into the window: a menu, an on-screen display.
  * The Vulkan counterpart of d3d8_present_set_overlay.

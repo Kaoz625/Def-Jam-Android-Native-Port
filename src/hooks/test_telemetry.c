@@ -31,6 +31,8 @@
 #include "recomp/gen/recomp_types.h"
 #include "recorder.h"
 #include "test_observations.h"
+#include "rollback.h"
+#include "netplay.h"
 
 #define ACTORS        0x003B92E0u
 #define STRIDE        0x12E8u
@@ -296,11 +298,46 @@ void defjam_test_rng(uint32_t stack)
     end_line();
 }
 
+#define RB_HASH131_RING 4096
+static uint64_t rb_hash131[RB_HASH131_RING];
+static long long rb_hash131_step[RB_HASH131_RING];
+void defjam_test_set_step(long long step){if(s_in_match&&step>=0)s_step=step;}
+unsigned long long defjam_test_step_hash(long long step){
+    if(step<0)return 0;unsigned k=(unsigned long long)step%RB_HASH131_RING;
+    return rb_hash131_step[k]==step?rb_hash131[k]:0;
+}
+static uint64_t hash_range(uint64_t h, uint32_t lo, uint32_t hi)
+{
+    const uint32_t *w = (const uint32_t *)XBOX_PTR(lo);
+    size_t n = (hi - lo) / 4, k;
+    for (k = 0; k < n; k++) h = (h ^ w[k]) * 0x100000001B3ull;
+    return h;
+}
+
+/* Sim-owned words only: the four fighter records, the match globals 0x3B8F28..0x3B9074, the match
+ * generator 0x3C1404 and the four AI generators 0x3BFC70 + 0x88 * n. */
+static uint64_t fingerprint(void)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    h = hash_range(h, ACTORS, ACTORS + SLOTS * STRIDE);
+    h = hash_range(h, 0x003B8F28u, 0x003B9074u);
+    h = hash_range(h, G_RNG_STATE, G_RNG_STATE + 8);
+    h = hash_range(h, 0x003BFC70u, 0x003BFC70u + 4 * 0x88u);
+    return h;
+}
 /* sub_00087700: one simulation step of a live fight is about to run. */
 void defjam_test_step(void)
 {
     int slot;
+#if defined(__ANDROID__)
+    /* Existing 87700 enter hook runs even with test telemetry disabled.
+     * A progressing simulation must show fighting controls, not a stale menu hint. */
+    extern void defjam_android_note_fight_step(void);
+    if(!netplay_replaying131())defjam_android_note_fight_step();
+#endif
     if (!defjam_test_observations_enabled() || !s_in_match) return;
+    if(rollback_enabled()){unsigned hash_slot131=(unsigned long long)s_step%RB_HASH131_RING;
+        rb_hash131[hash_slot131]=fingerprint();rb_hash131_step[hash_slot131]=s_step;}
     s_step++;
     if (s_step == 1 || s_step == 300 || s_step == 900) draws_report(s_step == 1 ? "step1" : s_step == 300 ? "step300" : "step900");
 

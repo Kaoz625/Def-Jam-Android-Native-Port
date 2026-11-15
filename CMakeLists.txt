@@ -17,8 +17,59 @@ cmake_minimum_required(VERSION 3.20)
 
 project(defjam_recomp VERSION 0.10.6 LANGUAGES C CXX)
 
+# DEFJAM_FG34_DEFERRED_BUILD
+if(ANDROID)
+    enable_language(CXX)
+    add_subdirectory("${CMAKE_SOURCE_DIR}/tools/xboxrecomp/src/d3d/fg34" "${CMAKE_BINARY_DIR}/defjam-fg34")
+    cmake_language(DEFER ID defjam_fg34 CALL include "${CMAKE_SOURCE_DIR}/tools/xboxrecomp/src/d3d/fg34/Integrar34.cmake")
+endif()
+# END_DEFJAM_FG34_DEFERRED_BUILD
+# DEFJAM_LSFG27_DEFERRED_BUILD
+if(ANDROID)
+    enable_language(CXX)
+    add_subdirectory("${CMAKE_SOURCE_DIR}/tools/xboxrecomp/src/d3d/lsfg27" "${CMAKE_BINARY_DIR}/defjam-lsfg27")
+    cmake_language(DEFER ID defjam_lsfg27 CALL include "${CMAKE_SOURCE_DIR}/tools/xboxrecomp/src/d3d/lsfg27/Integrar27.cmake")
+endif()
+# END_DEFJAM_LSFG27_DEFERRED_BUILD
+
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Android is built completely from local sources. The app module keeps SDL's
+# source and a locally-built arm64 shaderc beside the Gradle project so configuring
+# never reaches the network.
+if(ANDROID)
+    set(DEFJAM_ANDROID_VENDOR "${CMAKE_CURRENT_SOURCE_DIR}/android/vendor" CACHE PATH
+        "Offline Android dependency directory")
+    set(DEFJAM_ANDROID_SDL "${DEFJAM_ANDROID_VENDOR}/SDL" CACHE PATH "SDL3 source directory")
+    set(DEFJAM_ANDROID_SHADERC "${DEFJAM_ANDROID_VENDOR}/shaderc" CACHE PATH
+        "shaderc Android package (include/ and lib/<abi>/libshaderc.a)")
+    if(NOT EXISTS "${DEFJAM_ANDROID_SDL}/CMakeLists.txt")
+        message(FATAL_ERROR "SDL3 source missing at ${DEFJAM_ANDROID_SDL}. See android/README.md")
+    endif()
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${DEFJAM_ANDROID_SDL}" "${CMAKE_BINARY_DIR}/SDL" EXCLUDE_FROM_ALL)
+
+    set(_shaderc_lib "${DEFJAM_ANDROID_SHADERC}/lib/${ANDROID_ABI}/libshaderc.a")
+    if(NOT EXISTS "${DEFJAM_ANDROID_SHADERC}/include/shaderc/shaderc.h" OR NOT EXISTS "${_shaderc_lib}")
+        message(FATAL_ERROR "Offline shaderc package is incomplete at ${DEFJAM_ANDROID_SHADERC}. See android/README.md")
+    endif()
+    add_library(defjam_shaderc_android STATIC IMPORTED GLOBAL)
+    set_target_properties(defjam_shaderc_android PROPERTIES
+        IMPORTED_LOCATION "${_shaderc_lib}"
+        INTERFACE_INCLUDE_DIRECTORIES "${DEFJAM_ANDROID_SHADERC}/include")
+    set(XBOXRECOMP_SHADERC_TARGET defjam_shaderc_android CACHE STRING "shaderc target" FORCE)
+
+    # Vulkan function dispatch is owned by Volk so a selected Turnip package
+    # and the system driver use exactly the same function table. AdrenoTools
+    # loads custom Qualcomm/Turnip drivers from the app's private directory.
+    add_subdirectory("${DEFJAM_ANDROID_VENDOR}/volk" "${CMAKE_BINARY_DIR}/volk")
+    add_subdirectory("${DEFJAM_ANDROID_VENDOR}/libadrenotools" "${CMAKE_BINARY_DIR}/libadrenotools")
+endif()
 
 if(WIN32)
     add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -65,8 +116,12 @@ file(GLOB PATCH_SOURCES      CONFIGURE_DEPENDS "src/patches/*.c")
 option(DEFJAM_BUILD_GAME "Build the game executable (requires src/recomp/gen from scripts/recomp.ps1)" ON)
 
 if(DEFJAM_BUILD_GAME AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen/recomp_dispatch.c")
-    message(WARNING "src/recomp/gen is empty — run scripts/recomp.ps1. Building runtime libraries only.")
-    set(DEFJAM_BUILD_GAME OFF)
+    if(ANDROID)
+        message(FATAL_ERROR "src/recomp/gen is empty. Recompile your verified dump locally before building the APK.")
+    else()
+        message(WARNING "src/recomp/gen is empty — run scripts/recomp.ps1. Building runtime libraries only.")
+        set(DEFJAM_BUILD_GAME OFF)
+    endif()
 endif()
 
 if(DEFJAM_BUILD_GAME)
@@ -94,40 +149,70 @@ if(DEFJAM_BUILD_GAME)
             enable_language(OBJC)
             list(APPEND HOST_SOURCES src/host_macos.m)
         endif()
-        find_package(SDL3 REQUIRED CONFIG)
+        if(NOT TARGET SDL3::SDL3)
+            find_package(SDL3 REQUIRED CONFIG)
+        endif()
         find_package(Vulkan REQUIRED)
         include(imgui)
         include(app_icon)
     endif()
-    add_executable(${PROJECT_NAME} WIN32
-        src/main.c
-        src/recomp_manual.c
-        ${HOST_SOURCES}
-        ${HOOK_SOURCES}
-        ${PATCH_SOURCES}
-        ${RECOMP_GEN_SOURCES}
-    )
-    target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
+    if(ANDROID)
+        set(DEFJAM_GAME_TARGET main)
+        add_library(${DEFJAM_GAME_TARGET} SHARED
+            src/android_bridge.c
+            src/android_thread_policy.c
+            src/main.c
+            src/recomp_manual.c
+            ${HOST_SOURCES}
+            ${HOOK_SOURCES}
+            ${PATCH_SOURCES}
+            ${RECOMP_GEN_SOURCES})
+    else()
+        set(DEFJAM_GAME_TARGET ${PROJECT_NAME})
+        add_executable(${DEFJAM_GAME_TARGET} WIN32
+            src/main.c
+            src/recomp_manual.c
+            ${HOST_SOURCES}
+            ${HOOK_SOURCES}
+            ${PATCH_SOURCES}
+            ${RECOMP_GEN_SOURCES})
+    endif()
+    target_compile_features(${DEFJAM_GAME_TARGET} PRIVATE cxx_std_17)
     if(WIN32)
-        target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp recomp_settings defjam_imgui d3d11 dxgi dxguid xinput winmm dbghelp shell32 comdlg32)
+        target_link_libraries(${DEFJAM_GAME_TARGET} PRIVATE xboxrecomp recomp_settings defjam_imgui d3d11 dxgi dxguid xinput winmm dbghelp shell32 comdlg32)
     else()
         # One SDL for the window, the sound and the pads: SDL3, the system's.
-        defjam_app_icon(${PROJECT_NAME})
-        target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp recomp_settings defjam_imgui
-                              SDL3::SDL3 Vulkan::Vulkan ${CMAKE_DL_LIBS} m)
+        defjam_app_icon(${DEFJAM_GAME_TARGET})
+        target_link_libraries(${DEFJAM_GAME_TARGET} PRIVATE xboxrecomp recomp_settings defjam_imgui
+                              SDL3::SDL3 ${CMAKE_DL_LIBS} m)
+        if(NOT ANDROID)
+            target_link_libraries(${DEFJAM_GAME_TARGET} PRIVATE Vulkan::Vulkan)
+        endif()
+        if(ANDROID)
+            target_link_libraries(${DEFJAM_GAME_TARGET} PRIVATE android log)
+            target_link_options(${DEFJAM_GAME_TARGET} PRIVATE "-Wl,-z,max-page-size=16384")
+        endif()
         if(APPLE)
             # Shift held at start-up (src/host_posix.c) is read from the window server.
             target_link_libraries(${PROJECT_NAME} PRIVATE "-framework ApplicationServices" "-framework AppKit")
         endif()
         # SDL opens the Vulkan loader by name; tell it where this build's is.
-        target_compile_definitions(${PROJECT_NAME} PRIVATE
-            DEFJAM_VULKAN_LIBRARY="${Vulkan_LIBRARY}")
+        if(ANDROID)
+            # The imported Vulkan target points into the NDK sysroot on the
+            # build PC.  That absolute host path cannot be dlopen()ed by SDL
+            # on a phone; Android exposes its loader by this soname.
+            target_compile_definitions(${DEFJAM_GAME_TARGET} PRIVATE
+                DEFJAM_VULKAN_LIBRARY="libvulkan.so")
+        else()
+            target_compile_definitions(${DEFJAM_GAME_TARGET} PRIVATE
+                DEFJAM_VULKAN_LIBRARY="${Vulkan_LIBRARY}")
+        endif()
         # The lifted code was written against a compiler that does none of
         # these: it reads memory through casts of every width, relies on
         # wrapping arithmetic, and must not have a multiply and an add fused
         # into one rounding (arm64 does that by default, and the game's
         # simulation would then differ from the Windows build's).
-        target_compile_options(${PROJECT_NAME} PRIVATE
+        target_compile_options(${DEFJAM_GAME_TARGET} PRIVATE
             -fno-strict-aliasing -fwrapv -ffp-contract=off -g)
         if(APPLE)
             # One named section for the title's code (src/recomp/guest_section.h).
@@ -136,10 +221,10 @@ if(DEFJAM_BUILD_GAME)
         endif()
         # Keep every lifted function's name in the dynamic symbol table, so
         # the crash report can name the one that faulted.
-        set_target_properties(${PROJECT_NAME} PROPERTIES ENABLE_EXPORTS ON)
+        set_target_properties(${DEFJAM_GAME_TARGET} PROPERTIES ENABLE_EXPORTS ON)
     endif()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE DEFJAM_VERSION=\"${PROJECT_VERSION}\")
-    target_include_directories(${PROJECT_NAME} PRIVATE
+    target_compile_definitions(${DEFJAM_GAME_TARGET} PRIVATE DEFJAM_VERSION=\"${PROJECT_VERSION}\")
+    target_include_directories(${DEFJAM_GAME_TARGET} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
         ${XBOXRECOMP_DIR}/include
@@ -154,26 +239,26 @@ if(DEFJAM_BUILD_GAME)
         ${XBOXRECOMP_DIR}/src/nv2a
     )
     if(MSVC)
-        target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)
+        target_link_options(${DEFJAM_GAME_TARGET} PRIVATE /LARGEADDRESSAWARE)
         # Generated chunks are huge; also keep debug info even in Release so the
         # VEH handler can name guest functions from the PDB.
-        target_compile_options(${PROJECT_NAME} PRIVATE /bigobj /Zi)
+        target_compile_options(${DEFJAM_GAME_TARGET} PRIVATE /bigobj /Zi)
         # Linker map lets scripts/sample-threads.py and tools/symbolize.py name guest functions from a host RIP.
         # /DYNAMICBASE:NO loads the image at the map's preferred address, so a RIP in a crash report is the
         # map address with no rebasing, and is the same across runs. /OPT:NOICF stops the linker folding
         # identical function bodies together, which it otherwise does freely here: thousands of lifted
         # functions translate to byte-identical code, and folding makes a crash report name whichever of
         # them won the merge rather than the one that ran.
-        target_link_options(${PROJECT_NAME} PRIVATE /DEBUG /MAP:${CMAKE_BINARY_DIR}/defjam_recomp.map
+        target_link_options(${DEFJAM_GAME_TARGET} PRIVATE /DEBUG /MAP:${CMAKE_BINARY_DIR}/defjam_recomp.map
                             /DYNAMICBASE:NO /OPT:NOICF)
     endif()
     # Debug-only diagnostics (toggle from the preset or command line)
     option(DEFJAM_ICALL_TRACE "Trace indirect calls (slow, verbose)" OFF)
     option(DEFJAM_VERBOSE_KERNEL "Log every kernel call" OFF)
     if(DEFJAM_ICALL_TRACE)
-        target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_ICALL_TRACE=1)
+        target_compile_definitions(${DEFJAM_GAME_TARGET} PRIVATE ENABLE_ICALL_TRACE=1)
     endif()
     if(DEFJAM_VERBOSE_KERNEL)
-        target_compile_definitions(${PROJECT_NAME} PRIVATE VERBOSE_KERNEL_LOG=1)
+        target_compile_definitions(${DEFJAM_GAME_TARGET} PRIVATE VERBOSE_KERNEL_LOG=1)
     endif()
 endif()

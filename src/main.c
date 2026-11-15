@@ -37,6 +37,9 @@
 #endif
 
 #include "host.h"
+#if defined(__ANDROID__)
+#include "platform/android_thread_policy.h"
+#endif
 #if defined(_WIN32)
 #include <dbghelp.h>
 #else
@@ -47,6 +50,9 @@
 #endif
 #include <signal.h>
 #include <unistd.h>
+#if defined(__ANDROID__)
+#include <fcntl.h>
+#endif
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -501,6 +507,10 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
  * its neighbours, and an access to one of those is completed as memory. */
 static void fault_handler(int sig, siginfo_t *si, void *ctx)
 {
+#if defined(__ANDROID__)
+    /* Also service the watch when this game's crash route is the outer handler. */
+    if(sig==SIGSEGV && si && si->si_code==SEGV_ACCERR && mmio_write_watch_handle131(si->si_addr,ctx))return;
+#endif
     uintptr_t fault_addr = (uintptr_t)si->si_addr;
     uintptr_t rel = fault_addr - (uintptr_t)g_xbox_mem_offset;
 
@@ -635,6 +645,10 @@ static int host_main(void)
                    "Place the game files in the 'game' subdirectory.");
         return 1;
     }
+#if defined(__ANDROID__)
+    /* DEFJAM_LANGUAGE37_XBE: only validated .data/.rdata changes. */
+    { extern void pc_language_patch_xbe(void *, size_t); pc_language_patch_xbe(xbe_data, xbe_size); }
+#endif
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
     /* Report the audio codec as present, before the layout is built.
@@ -851,6 +865,10 @@ static int host_main(void)
                             " only at kernel calls\n");
 #endif
         xbox_PinToGuestCore();
+#if defined(__ANDROID__)
+        defjam_android_guest_thread_note("guest-main", "xbe_entry_point",
+                (uintptr_t)xbe_entry_point, 0, GetCurrentThreadId());
+#endif
     }
     xbe_entry_point();
 
@@ -902,13 +920,171 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 }
 
 /* Console entry point (for debugging -- lets you see printf output) */
+#if defined(__ANDROID__)
+#include "android_frame_pacer.h"
+static void android_use_root(int argc, char **argv)
+{
+    const char *root = NULL;
+    const char *driver_dir = NULL;
+    const char *driver_lib = NULL;
+    const char *hook_dir = NULL;
+    const char *guest_cores = NULL;
+    const char *native_cores = NULL;
+    const char *native_layout = NULL;
+    const char *vertex_threads = NULL;
+    const char *framegen = NULL;
+    const char *fps_limit = NULL;
+    const char *vk_async = NULL;
+    const char *render_fast136 = NULL;
+    const char *fxaa = NULL;
+    const char *legacy_fxaa145=NULL;
+    const char *fsr144=NULL,*filter144=NULL,*aniso144=NULL,*preload144=NULL;
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "--root=", 7))
+            root = argv[i] + 7;
+        else if (!strcmp(argv[i], "--root") && i + 1 < argc)
+            root = argv[++i];
+        else if (!strncmp(argv[i], "--driver-dir=", 13))
+            driver_dir = argv[i] + 13;
+        else if (!strncmp(argv[i], "--driver-lib=", 13))
+            driver_lib = argv[i] + 13;
+        else if (!strncmp(argv[i], "--hook-dir=", 11))
+            hook_dir = argv[i] + 11;
+        else if (!strncmp(argv[i], "--guest-cores=", 14))
+            guest_cores = argv[i] + 14;
+        else if (!strncmp(argv[i], "--native-cores=", 15))
+            native_cores = argv[i] + 15;
+        else if (!strncmp(argv[i], "--native-layout=", 16))
+            native_layout = argv[i] + 16;
+        else if (!strncmp(argv[i], "--framegen=", 11))
+            framegen = argv[i] + 11;
+        else if (!strncmp(argv[i], "--vertex-threads=", 17))
+            vertex_threads = argv[i] + 17;
+        else if (!strncmp(argv[i], "--fps-limit=", 12))
+            fps_limit = argv[i] + 12;
+        else if (!strncmp(argv[i], "--vk-async=", 11))
+            vk_async = argv[i] + 11;
+        else if (!strncmp(argv[i], "--render-fast=", 14))
+            render_fast136 = argv[i] + 14;
+        else if (!strncmp(argv[i], "--fxaa=", 7))
+            fxaa = argv[i] + 7;
+        else if(!strncmp(argv[i],"--legacy-fxaa145=",17))legacy_fxaa145=argv[i]+17;
+        else if(!strncmp(argv[i],"--fsr144=",9))fsr144=argv[i]+9;
+        else if(!strncmp(argv[i],"--filter144=",12))filter144=argv[i]+12;
+        else if(!strncmp(argv[i],"--aniso144=",11))aniso144=argv[i]+11;
+        else if(!strncmp(argv[i],"--preload144=",13))preload144=argv[i]+13;
+    }
+    if (!root || !*root)
+        root = "/storage/emulated/0/DefJamFFNY";
+    if (chdir(root) != 0) {
+        fprintf(stderr, "[ANDROID] cannot enter data root %s\n", root);
+        return;
+    }
+    {
+        int fd = open("defjam-native.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0) {
+            dup2(fd, STDERR_FILENO);
+            dup2(fd, STDOUT_FILENO);
+            close(fd);
+            /* External storage is expensive on some devices. The runtime
+             * already flushes periodic status and crash diagnostics. */
+            setvbuf(stderr, NULL, _IOFBF, 1 << 18);
+            setvbuf(stdout, NULL, _IOFBF, 1 << 18);
+        }
+    }
+    setenv("DEFJAM_DATA", root, 1);
+    {
+        FILE *profile=fopen("perf-profile.txt","r");
+        int enabled=profile!=NULL;
+        char mode[16]={0};
+        if(profile){fgets(mode,sizeof mode,profile);fclose(profile);}
+        setenv("RECOMP_KERNEL_PROFILE",enabled?(!strncmp(mode,"frame",5)?"frame":"1"):"0",1);
+    }
+    setenv("RECOMP_SPACE_BACKOFF",access("space-backoff-off.txt",F_OK)==0?"0":"1",1);
+    setenv("RECOMP_VK_PRESENT_MODE",access("present-fifo.txt",F_OK)==0?"fifo":"mailbox",1);
+    extern void defjam_perf_init(void);
+    defjam_perf_init();
+    if(fxaa){setenv("RECOMP_VK_FXAA",!strcmp(fxaa,"1")?"1":"0",1);setenv("DEFJAM_EXPLICIT_FXAA145","1",1);}
+    setenv("DEFJAM_LEGACY_FXAA145",legacy_fxaa145&&!strcmp(legacy_fxaa145,"1")?"1":"0",1);
+    if(fsr144)setenv("RECOMP_VK_FSR144",fsr144,1);
+    if(filter144)setenv("RECOMP_VK_FILTER144",filter144,1);
+    if(aniso144)setenv("RECOMP_VK_ANISO144",aniso144,1);
+    if(preload144)setenv("RECOMP_VK_PRELOAD144",preload144,1);
+    setenv("RECOMP_CPU_FAST", access("cpu-v18.txt", F_OK) == 0 ? "0" : "1", 1);
+    fprintf(stderr, "[ANDROID] CPU fast %s (v19; cpu-v18.txt selects v18 lookup/parser)\n",
+            getenv("RECOMP_CPU_FAST"));
+    {
+        int n = native_cores && native_cores[0] >= '0' && native_cores[0] <= '8' && !native_cores[1]
+                ? native_cores[0] - '0' : 0;
+        char value[2] = { (char)('0' + n), 0 };
+        setenv("RECOMP_NATIVE_CORES", value, 1);
+        setenv("RECOMP_NATIVE_LAYOUT", native_layout && !strcmp(native_layout,"split")
+                && guest_cores && !strcmp(guest_cores,"1") ? "split" : "auto", 1);
+        defjam_android_cpu_init();
+        fprintf(stderr, "[ANDROID] native CPU budget %s (v18; separate from guest)\n", n ? value : "auto");
+    }
+    setenv("RECOMP_RENDER_FAST", (render_fast136 && !strcmp(render_fast136,"0")) || access("render-v16.txt", F_OK) == 0 ? "0" : "1", 1);
+    fprintf(stderr, "[ANDROID] render fast %s (v17; render-v16.txt selects v16 paths)\n",
+            getenv("RECOMP_RENDER_FAST"));
+    if (guest_cores) {
+        // Numeric launcher choices override the legacy multicore.txt opt-in.
+        int n = guest_cores[0] >= '1' && guest_cores[0] <= '8' && !guest_cores[1]
+                ? guest_cores[0] - '0' : 1;
+        char value[2] = { (char)('0' + n), 0 };
+        setenv("RECOMP_GUEST_CORES", value, 1);
+        fprintf(stderr, "[ANDROID] guest CPU request %d (restart required; >1 experimental)\n", n);
+    }
+    {
+        int n = vertex_threads && vertex_threads[0] >= '1' && vertex_threads[0] <= '8' && !vertex_threads[1]
+                ? vertex_threads[0] - '0' : 2;
+        if(access("vertex-serial.txt",F_OK)==0)n=1;
+        char value[2] = { (char)('0' + n), 0 };
+        setenv("RECOMP_VERTEX_THREADS", value, 1);
+    }
+    setenv("DEFJAM_FRAMEGEN", framegen && !strcmp(framegen, "2") ? "2" : "0", 1);
+    setenv("RECOMP_VK_ASYNC", vk_async && !strcmp(vk_async, "0") ? "0" : "1", 1);
+    fprintf(stderr, "[ANDROID] async Vulkan queue %s (v16)\n", getenv("RECOMP_VK_ASYNC"));
+    fprintf(stderr,"[GPUCOMPAT136] async=%s render_fast=%s; explicit fallback, may reduce throughput; no guest/simulation changes\n",getenv("RECOMP_VK_ASYNC"),getenv("RECOMP_RENDER_FAST"));
+    if (fps_limit) {
+        char value[4];
+        snprintf(value, sizeof value, "%d", !strcmp(fps_limit,"-1")?-1:defjam_frame_limit_value(fps_limit));
+        setenv("DEFJAM_FPS_LIMIT", value, 1);
+        fprintf(stderr, "[ANDROID] present limit %s FPS (0=original)\n", getenv("DEFJAM_FPS_LIMIT"));
+    }
+    /* Opt-in: multicore.txt in the data root lets guest threads run on every CPU
+     * (RECOMP_GUEST_CORES=all). Delete the file for the safe single-CPU default. */
+    if (access("multicore.txt", F_OK) == 0 && !getenv("RECOMP_GUEST_CORES")) {
+        setenv("RECOMP_GUEST_CORES", "all", 1);
+        fprintf(stderr, "[ANDROID] multicore.txt found: guest threads on all CPUs\n");
+    }
+    if (!getenv("RECOMP_KERNEL_LOG_BUDGET"))
+        setenv("RECOMP_KERNEL_LOG_BUDGET", "80", 0);
+    if (driver_dir && *driver_dir && driver_lib && *driver_lib) {
+        setenv("DEFJAM_GPU_DRIVER_DIR", driver_dir, 1);
+        setenv("DEFJAM_GPU_DRIVER_LIB", driver_lib, 1);
+    }
+    if (hook_dir && *hook_dir)
+        setenv("DEFJAM_GPU_HOOK_DIR", hook_dir, 1);
+    fprintf(stderr, "[ANDROID] data root %s\n", root);
+    fprintf(stderr, "[ANDROID] Vulkan driver: %s\n",
+            driver_lib && *driver_lib ? driver_lib : "system");
+}
+
+/* SDLActivity looks up SDL_main in libmain.so. */
+__attribute__((visibility("default"))) int SDL_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
 #if defined(_WIN32)
     (void)argc;
     (void)argv;
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
 #else
+#if defined(__ANDROID__)
+    android_use_root(argc, argv);
+#endif
     pc_settings_set_args(argc, argv);
     {
         /* The window, if there is one, needs this thread; see host_posix.c. */

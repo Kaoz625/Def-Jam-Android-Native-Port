@@ -108,6 +108,10 @@ int xbox_HostInputKeyboardSlot(void);
  * Windows virtual-key code, including VK_LBUTTON and friends for the mouse. */
 void xbox_HostInputKey(int code, int down);
 void xbox_HostInputWheel(int notches);          /* positive is away from the user */
+#if defined(__ANDROID__)
+/* Already calibrated signed Xbox axes, owned by the local touch overlay. */
+void xbox_HostInputTouchSticks(int lx,int ly,int rx,int ry);
+#endif
 void xbox_HostInputFocus(int focused);          /* losing focus releases every key */
 
 /* A host menu is open: the title polls every pad (and the keyboard player) at
@@ -134,6 +138,31 @@ DWORD xbox_HostInputRumble(int slot, WORD low, WORD high);
 /* What is in a slot: 0 empty, 1 a pad, 2 the keyboard, 3 both (merged). Copies
  * a short description into `name` if given. */
 int xbox_HostInputSlotInfo(int slot, char *name, int size);
+
+/* Online play: this PC's player (its first device: the pad or keyboard in slot 1)
+ * is seen in `local_slot`, the other player's controller, as `remote` reports it,
+ * in `remote_slot`, and every other slot is empty. Rumble for the local slot goes
+ * to that device; rumble for the remote slot is dropped. `enable` 0 restores the
+ * ordinary assignment. The hub has at least two controllers while it is on. */
+void xbox_HostInputSetNetplay(int enable, int local_slot, int remote_slot,
+                              DWORD (*remote)(XBOX_INPUT_STATE *state));
+
+/* Online play with more than one other player: this PC's player in `local_slot`, every slot in
+ * `remote_mask` (bit n = slot n) reported by `remote` for that slot, every other slot empty. */
+void xbox_HostInputSetNetplayMulti(int enable, int local_slot, unsigned remote_mask,
+                                   DWORD (*remote)(int slot, XBOX_INPUT_STATE *state));
+
+/* Online play, during a fight that runs in lockstep: `buttons` are taken out of what the title
+ * reads from every controller, and every slot that is no player's reads as a pad at rest instead
+ * of an unplugged one. A title may read its pause button straight from its controllers rather
+ * than from the agreed inputs, so a press would pause one game of the room only; and a port that
+ * reads as unplugged during a fight can make a title stop for a "controller disconnected" prompt,
+ * again on one PC. 0 restores both. Ignored while netplay is off. */
+void xbox_HostInputSetNetplayFight(WORD suppress_buttons);
+
+/* This PC's player's state as the title would read it (the first device), for
+ * online play to send; it ignores the netplay assignment. */
+DWORD xbox_HostInputGetLocalState(XBOX_INPUT_STATE *state);
 
 #ifdef __cplusplus
 }

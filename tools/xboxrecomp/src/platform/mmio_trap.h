@@ -24,6 +24,13 @@
 
 #if !defined(_WIN32)
 
+/* Optional read-only heap write watch. Called only for SEGV_ACCERR; callback
+ * must validate its own protected range, be signal-safe, and return1 if handled. */
+typedef int (*mmio_write_watch_fn)(void *address,void *context);
+int mmio_write_watch_claim(mmio_write_watch_fn handler);
+int mmio_write_watch_handle131(void *address,void *context);
+void mmio_write_watch_release(mmio_write_watch_fn handler);
+
 typedef uint64_t (*mmio_trap_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_trap_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
 

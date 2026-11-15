@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <string.h>
 #include "apu_xaudio2.h"
+#if defined(__ANDROID__)
+#include "platform/android_thread_policy.h"
+#include "platform/android_sched.h"
+#endif
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
  * stubbed to report inactive; real audio output via SDL2 comes later. */
@@ -188,8 +192,14 @@ int xa2_get_buffer_size(void)
  * waiting: two submissions, 43 ms. Without it the ring sits near empty and
  * any lateness in the mixer is a gap. Above XA2_RING_MAX a submission is
  * refused, which bounds the delay when the mixer's clock runs fast. */
-#define XA2_PREROLL       (2 * XA2_BUF_SAMPLES)
-#define XA2_RING_MAX      (4 * XA2_BUF_SAMPLES)
+#if defined(__ANDROID__)
+static unsigned g_preroll=2*XA2_BUF_SAMPLES,g_ring_max=4*XA2_BUF_SAMPLES;
+#define XA2_PREROLL g_preroll
+#define XA2_RING_MAX g_ring_max
+#else
+#define XA2_PREROLL (2 * XA2_BUF_SAMPLES)
+#define XA2_RING_MAX (4 * XA2_BUF_SAMPLES)
+#endif
 
 /* A ring the device's callback drains. SDL's own queue cannot tell "empty
  * because the device took it all into its buffer" from "empty because nothing
@@ -207,9 +217,17 @@ int  g_xa2_dropped, g_xa2_starved;
 
 static void sdl_callback(void *user, Uint8 *stream, int len)
 {
+#if defined(__ANDROID__)
+    static _Thread_local int named;
+    if (!named) {
+        defjam_android_native_thread_enter("audio", "sdl_callback", (uintptr_t)sdl_callback);
+        named = 1;
+    }
+#endif
     int16_t (*out)[XA2_CHANNELS] = (void *)stream;
     unsigned want = (unsigned)len / (XA2_CHANNELS * sizeof(int16_t)), i;
     unsigned have = g_ring_w - g_ring_r;
+    unsigned missing=0;
 
     (void)user;
     if (!g_primed) {
@@ -225,6 +243,7 @@ static void sdl_callback(void *user, Uint8 *stream, int len)
         memcpy(out[i], g_ring[(g_ring_r + i) % RING_FRAMES], sizeof out[i]);
     g_ring_r += have;
     if (have < want) {
+        missing=want-have;
         memset(out[have], 0, (size_t)(want - have) * sizeof out[0]);
         /* One gap however many callbacks it lasts, and none before the title
          * has sent anything. */
@@ -236,6 +255,9 @@ static void sdl_callback(void *user, Uint8 *stream, int len)
     } else {
         g_dry = 0;
     }
+#if defined(__ANDROID__)
+    defjam_monitor_audio(g_ring_w-g_ring_r,g_xa2_starved,g_xa2_dropped,missing);
+#endif
 }
 
 #ifdef XBOXRECOMP_HAVE_SDL3
@@ -267,6 +289,14 @@ int xa2_init(void)
 
     if (g_xa2_initialized)
         return 1;
+#if defined(__ANDROID__)
+    const char *buffer_ms=getenv("DEFJAM_AUDIO_BUFFER_MS");
+    int ms=buffer_ms?atoi(buffer_ms):60;if(ms<43)ms=43;if(ms>85)ms=85;
+    g_preroll=((unsigned)ms*48+255)&~255u;
+    g_ring_max=g_preroll+2*XA2_BUF_SAMPLES;
+    if(g_ring_max>RING_FRAMES-XA2_BUF_SAMPLES)g_ring_max=RING_FRAMES-XA2_BUF_SAMPLES;
+    fprintf(stderr,"[AUDIO121] preroll=%u frames (%.1fms) max=%u frames; rate remains 48000Hz, guest audio unchanged\n",g_preroll,g_preroll/48.0,g_ring_max);
+#endif
     /* A run without a display is an unattended one: keep its timing (the
      * dummy driver consumes at the real rate) and keep it quiet. */
     if (getenv("RECOMP_HEADLESS") && !getenv("SDL_AUDIODRIVER") && !getenv("SDL_AUDIO_DRIVER")) {

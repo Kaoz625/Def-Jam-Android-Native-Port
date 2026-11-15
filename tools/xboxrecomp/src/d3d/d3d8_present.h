@@ -115,6 +115,9 @@ static inline unsigned d3d8_present_interval_for(unsigned hz)
 /* 1 = smooth (bilinear), 0 = sharp (nearest). */
 void d3d8_present_set_linear_filter(int linear);
 
+/* Recent Vulkan presentation rate, sampled over roughly two seconds. */
+float d3d8_present_fps(void);
+
 /* A host program's drawing on top of the picture, in window pixels, after the
  * title's target has been scaled into the window: a menu, an on-screen display.
  * It runs on the thread that presents, on the immediate context (the pointers are Direct3D 11 interfaces; plain

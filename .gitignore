@@ -17,6 +17,10 @@ extracted/
 # ---- build output ----
 build/
 out/
+android/.gradle/
+android/app/build/
+android/vendor/*
+!android/vendor/.gitkeep
 cmake-build-*/
 *.obj
 *.o
@@ -58,3 +62,21 @@ tests/golden/*.png
 # ---- personal agent settings (the shared .claude/skills, .claude/agents, .codex/skills are generated and tracked) ----
 .claude/settings.local.json
 CLAUDE.local.md
+
+# Android loader source snapshots (licenses kept; no built libraries)
+!android/vendor/volk/
+!android/vendor/volk/**
+!android/vendor/libadrenotools/
+!android/vendor/libadrenotools/**
+!android/vendor/THIRD-PARTY-NOTICES.txt
+
+# Local Android configuration, signing and install outputs
+local.properties
+key.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+.cxx/
+/save/
+.env

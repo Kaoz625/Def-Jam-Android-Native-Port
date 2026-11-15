@@ -36,6 +36,12 @@ ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE] = {0};
  * Logging Implementation
  * ============================================================================ */
 
+/* DEFJAM_KERNEL_LOG26_SOURCE_GUARD: only the logger, never ordinals/game state. */
+#if defined(__ANDROID__)
+static int g_kernel_log_enabled26 = 0;
+#else
+static int g_kernel_log_enabled26 = 1;
+#endif
 static FILE* g_log_file = NULL;
 static int   g_log_level = XBOX_LOG_INFO;
 static CRITICAL_SECTION g_log_cs;
@@ -55,6 +61,10 @@ static const char* xbox_log_level_str(int level)
 
 void xbox_log(int level, const char* subsystem, const char* fmt, ...)
 {
+    /* Return before timestamps, formatting, logging locks and IO. */
+    if (!g_kernel_log_enabled26)
+        return;
+
     va_list args;
     char timestamp[32];
     SYSTEMTIME st;
@@ -403,7 +413,14 @@ void xbox_kernel_init(void)
     g_log_cs_init = TRUE;
 
     /* Try to open log file, fall back to stderr */
-    g_log_file = fopen("xbox_kernel.log", "w");
+    #if defined(__ANDROID__)
+    const char *kernel26_env = getenv("DEFJAM_KERNEL_LOG26");
+    g_kernel_log_enabled26 = kernel26_env && kernel26_env[0] == '1';
+#else
+    g_kernel_log_enabled26 = 1;
+#endif
+    g_log_file = g_kernel_log_enabled26 ? fopen("xbox_kernel.log", "w") : NULL;
+    fprintf(stderr, "[KERNEL26] enabled=%d file_open=%d; xbox_log disabled path skips format,log-lock and IO\n", g_kernel_log_enabled26, g_log_file != NULL);
 
     /* Set log level from environment variable if present */
     const char* log_env = getenv("XBOX_LOG_LEVEL");

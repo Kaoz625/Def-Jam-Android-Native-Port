@@ -1,3 +1,6 @@
+#if defined(__ANDROID__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 /**
  * Xbox Memory Layout Implementation
  *
@@ -13,8 +16,53 @@
  */
 
 #include "xbox_memory_layout.h"
+#if defined(__ANDROID__)
+#include "platform/xbox_rollback_hooks.h"
+#include <stdatomic.h>
+#include <pthread.h>
+static _Atomic(xbox_guest_write_callback131) rb_write_notify131;
+static _Atomic(int (*)(uint32_t)) rb_free_defer131;
+static _Atomic uint32_t rb_watch_lo131,rb_watch_hi131,rb_watch_alias131;
+static pthread_rwlock_t rb_io_gate131=PTHREAD_RWLOCK_INITIALIZER;
+static _Thread_local unsigned rb_snapshot_depth131;
+static uintptr_t rb_native_base131(void);
+void xbox_rollback_watch_range131(uint32_t lo,uint32_t hi,uint32_t alias_delta){
+    atomic_store(&rb_watch_lo131,lo);atomic_store(&rb_watch_alias131,alias_delta);
+    atomic_store_explicit(&rb_watch_hi131,hi>lo?hi:0,memory_order_release);
+}
+void xbox_rollback_snapshot_begin131(void){if(!rb_snapshot_depth131++)pthread_rwlock_wrlock(&rb_io_gate131);}
+void xbox_rollback_snapshot_end131(void){if(rb_snapshot_depth131 && !--rb_snapshot_depth131)pthread_rwlock_unlock(&rb_io_gate131);}
+void xbox_set_guest_write_notify(xbox_guest_write_callback131 cb){atomic_store_explicit(&rb_write_notify131,cb,memory_order_release);}
+xbox_guest_write_scope131 xbox_guest_write_begin131(void *host,size_t length){
+    xbox_guest_write_scope131 scope={NULL,host,length,0};
+    uint32_t hi=atomic_load_explicit(&rb_watch_hi131,memory_order_acquire);
+    if(hi && length){
+        uintptr_t base=rb_native_base131(),a=(uintptr_t)host;
+        uint32_t lo=atomic_load(&rb_watch_lo131),alias=atomic_load(&rb_watch_alias131);
+        if(alias && a>=base+(uint64_t)lo+alias && a<base+(uint64_t)hi+alias)a-=alias;
+        /* A read may start before the watched range and cross into it. */
+        if(alias && a<base+(uint64_t)lo+alias && a>=base+alias && length>base+(uint64_t)lo+alias-a)a-=alias;
+        if(a<base+hi && (a>=base+lo || length>base+lo-a)){
+            pthread_rwlock_rdlock(&rb_io_gate131);scope.locked=1;
+        }
+    }
+    scope.callback=atomic_load_explicit(&rb_write_notify131,memory_order_acquire);
+    if(!length||!scope.callback||!scope.callback(host,length,1))scope.callback=NULL;
+    return scope;
+}
+void xbox_guest_write_end131(xbox_guest_write_scope131 scope){
+    if(scope.callback)scope.callback(scope.host,scope.length,0);
+    if(scope.locked)pthread_rwlock_unlock(&rb_io_gate131);
+}
+void xbox_notify_guest_write(void *host,size_t length){xbox_guest_write_scope131 scope=xbox_guest_write_begin131(host,length);xbox_guest_write_end131(scope);}
+void xbox_set_contig_free_defer(int (*cb)(uint32_t)){atomic_store_explicit(&rb_free_defer131,cb,memory_order_release);}
+
+#endif
 #include "kernel.h"
 #include "guest_vmem.h"
+#if defined(__ANDROID__)
+#include "platform/android_thread_policy.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1361,6 +1409,9 @@ int xbox_nv2a_probe_json(char *out, size_t size)
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
+#if defined(__ANDROID__)
+    defjam_android_native_thread_enter("render", "nv2a_ack_thread", (uintptr_t)nv2a_ack_thread);
+#endif
     volatile uint32_t *regs = (volatile uint32_t *)param;
     s_put_reg = (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
 #if defined(__APPLE__)
@@ -1736,8 +1787,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         if (s_nv2a_trace) {
@@ -1842,6 +1893,9 @@ static volatile LONG g_tick_stop;
 
 static DWORD WINAPI tick_thread(LPVOID param)
 {
+#if defined(__ANDROID__)
+    defjam_android_native_thread_enter("clock", "tick_thread", (uintptr_t)tick_thread);
+#endif
     (void)param;
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -2498,6 +2552,17 @@ void xbox_WatchdogStart(void)
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
 RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
 RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
+#if defined(__ANDROID__)
+void xbox_rollback_mmx_save131(uint64_t out[8]){
+    const RecompMmx *regs[8]={&g_mm0,&g_mm1,&g_mm2,&g_mm3,&g_mm4,&g_mm5,&g_mm6,&g_mm7};
+    _Static_assert(sizeof(RecompMmx)==sizeof(uint64_t),"guest MMX width");
+    for(unsigned i=0;i<8;i++)memcpy(out+i,regs[i],sizeof(uint64_t));
+}
+void xbox_rollback_mmx_restore131(const uint64_t in[8]){
+    RecompMmx *regs[8]={&g_mm0,&g_mm1,&g_mm2,&g_mm3,&g_mm4,&g_mm5,&g_mm6,&g_mm7};
+    for(unsigned i=0;i<8;i++)memcpy(regs[i],in+i,sizeof(uint64_t));
+}
+#endif
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
@@ -3156,11 +3221,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
-        /* The pushbuffer survey rides on the same poll, so either
-         * variable arms it. */
+        /* RECOMP_PB_EXEC is the normal renderer and must stay quiet. Treating
+         * it as tracing made Android print and flush DMA state every frame.
+         * Only explicit diagnostics arm the verbose reporting path. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                    || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+                    || getenv("RECOMP_PB_SCAN") != NULL;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
@@ -4006,7 +4071,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 
 /* Give a block back (RECOMP_HEAP_RECLAIM only). Returns 0 when the address is
  * not one this arena tracks, so the caller can try the general heap. */
-int xbox_ContiguousFree(uint32_t addr)
+int xbox_ContiguousFreeNow(uint32_t addr)
 {
     int i, found = 0;
 
@@ -4037,6 +4102,20 @@ int xbox_ContiguousFree(uint32_t addr)
     ReleaseSRWLockExclusive(&g_contig_lock);
     return found;
 }
+
+uint32_t xbox_ContiguousBlockSize(uint32_t addr);
+int xbox_ContiguousFree(uint32_t addr)
+{
+#if defined(__ANDROID__)
+    int (*cb)(uint32_t)=atomic_load_explicit(&rb_free_defer131,memory_order_acquire);
+    if(cb && xbox_ContiguousBlockSize(addr)>0 && cb(addr))return 1;
+#endif
+    return xbox_ContiguousFreeNow(addr);
+}
+#if defined(__ANDROID__)
+static uintptr_t rb_native_base131(void){return (uintptr_t)g_memory_offset;}
+int xbox_ContiguousAliasesReady(void){return g_contig_memory!=NULL && g_tiled_view!=NULL && xbox_TiledApertureSize()>=0x02A0D000u;}
+#endif
 
 /* Size of the block at addr (MmQueryAllocationSize), 0 if not tracked. */
 uint32_t xbox_ContiguousBlockSize(uint32_t addr)
@@ -4180,8 +4259,8 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
                     fprintf(stderr, "  [HEAP] %d live blocks of %u bytes (%u KB)\n",
                             hist[j].n, hist[j].size,
                             (unsigned)((uint64_t)hist[j].n * hist[j].size / 1024));
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         return 0;

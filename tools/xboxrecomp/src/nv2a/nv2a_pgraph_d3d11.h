@@ -38,6 +38,12 @@ int pgraph_d3d11_try_texture_pack(const RecompTextureSource *source,
 /* Process an NV2A PGRAPH method call. Called from push buffer parser.
  * Returns 1 if handled, 0 if unhandled (caller should log/ignore). */
 int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param);
+#if defined(__ANDROID__)
+/* ARRAY_ELEMENT16/32 are consumed by the push-buffer executor. This
+ * translator only counts them as unhandled; preserve those exact counters
+ * when the executor appends a complete index packet in one operation. */
+void pgraph_d3d11_note_index_words(uint32_t words);
+#endif
 
 /* Flush any pending draw commands (call at end of frame). */
 void pgraph_d3d11_flush(void);

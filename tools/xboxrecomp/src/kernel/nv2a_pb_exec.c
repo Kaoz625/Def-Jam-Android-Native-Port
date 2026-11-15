@@ -24,6 +24,15 @@
  * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
  * <prefix>NNN.bmp, so the result can be looked at without a display.
  */
+#if defined(__ANDROID__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include "android_vertex_pool.h"
+#include "android_pack_cache138.h"
+#include "platform/android_sched.h"
+#endif
+#include "platform/android_hitch.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -44,7 +53,23 @@
 #define NV_TLS __thread
 #endif
 #include "../nv2a/nv2a_pgraph_d3d11.h"   /* the D3D11 translator this feeds */
-#include "nv2a_vsh_cpu.h"                 /* shared vertex-program HLSL adapter */
+#include "nv2a_vsh_cpu.h"
+/* DEFJAM_V5: per-frame timing, printed as [PERF] by pgraph_d3d11_frame_end. */
+uint64_t g_pf_gather_ns, g_pf_draw_ns, g_pf_batches;
+uint64_t defjam_pf_now(void)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+                 /* shared vertex-program HLSL adapter */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -553,7 +578,7 @@ void xbox_Nv2aSetFlipHz(int hz) { InterlockedExchange(&s_flip_hz_override, hz > 
 
 static void flip_pace(void)
 {
-    static int env_hz = -1;
+    static int env_hz = -1, previous_hz140;
     int hz;
     static LARGE_INTEGER freq, next;
     LARGE_INTEGER now;
@@ -569,6 +594,7 @@ static void flip_pace(void)
         hz = (int)s_flip_hz_override;
     if (hz <= 0)
         return;
+    if(previous_hz140!=hz){next.QuadPart=0;previous_hz140=hz;}
     period = freq.QuadPart / hz;
     QueryPerformanceCounter(&now);
     if (next.QuadPart && now.QuadPart < next.QuadPart) {
@@ -647,9 +673,10 @@ void nv2a_pb_request_dump_next(void)
     }
 }
 
-static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
+static int fetch_attr_from(const VertexAttr *a, uint32_t index, float out[4],
+                           const uint8_t *mem, int inline_active,
+                           const uint32_t *inline_buf, uint32_t inline_count, int report)
 {
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
     uint32_t i;
 
@@ -657,15 +684,19 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     out[3] = 1.0f;
     if (!a->size || !a->stride)
         return 0;
-    if (s_gpu.inline_active) {
+    if (inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
          * one there, which is why the offset test is on the other side of this
          * branch. */
         size_t at = (size_t)a->offset + (size_t)index * a->stride;
-        if (at + 4 > (size_t)s_gpu.inline_count * 4)
+        size_t components = a->size < 4 ? a->size : 4;
+        size_t bytes = a->type == 2 ? components * 4
+                     : a->type == 1 || a->type == 5 ? components * 2
+                     : a->type == 4 ? components : 4;
+        if (at > (size_t)inline_count * 4 || bytes > (size_t)inline_count * 4 - at)
             return 0;
-        p = (const uint8_t *)s_gpu.inline_buf + at;
+        p = (const uint8_t *)inline_buf + at;
     } else {
         /* The low window or the contiguous one, nothing else. The attribute
          * pointer is the title's, taken from a push buffer, and one stale
@@ -677,7 +708,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
          || !((va >= 0x1000u && va + 16 <= 0x04000000u)
            || (va >= 0x80000000u && va + 16 <= 0x84000000u))) {
             static int warned;
-            if (a->offset && !warned) {
+            if (report && a->offset && !warned) {
                 warned = 1;
                 fprintf(stderr, "  [GPU] vertex attribute outside guest memory: offset "
                                 "0x%08X index %u stride %u; reading it as absent\n",
@@ -726,6 +757,222 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         return 0;
     }
 }
+
+static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
+{
+    return fetch_attr_from(a, index, out, (const uint8_t *)xbox_GetMemoryOffset(),
+                           s_gpu.inline_active, s_gpu.inline_buf, s_gpu.inline_count, 1);
+}
+
+#if defined(__ANDROID__)
+/* Capture state before dispatch. Workers only read this job/guest buffers and
+ * write their own packed output range; no guest code or Vulkan calls here. */
+typedef struct {
+    VertexAttr attr[16];
+    float current[16][4];
+    const uint8_t *mem;
+    const uint32_t *inline_buf, *indices;
+    uint32_t inline_count, used, per;
+    int inline_active, fast;
+    float *out;
+} NvAndroidGatherJob;
+static NvVertexPool s_vertex_pool = NV_VERTEX_POOL_INIT;
+static unsigned s_vertex_request;
+static PackCache138 s_pack138;
+static int s_pack_enabled138;
+static uint64_t s_pack_log138;
+static int s_vertex_configured;
+static int s_vertex_fast;
+static uint64_t s_vertex_parallel_batches, s_vertex_parallel_vertices;
+static uint64_t s_vertex_participation[9],s_vertex_small,s_vertex_eligible,s_vertex_max;
+static uint64_t s_index_bulk_packets, s_index_bulk_words;
+
+void nv2a_android_vertex_stats_report(void)
+{
+    if (s_index_bulk_packets) {
+        fprintf(stderr, "[ANDROID-PB-FAST] %llu index words in %llu packets; scalar order/counters retained\n",
+                (unsigned long long)s_index_bulk_words, (unsigned long long)s_index_bulk_packets);
+        s_index_bulk_packets = s_index_bulk_words = 0;
+    }
+    uint64_t total = 0;
+    for (unsigned n = 1; n <= 8; ++n) total += s_vertex_participation[n];
+    if (!total) return;
+    fprintf(stderr, "[ANDROID-VERTEX-JOBS] requested=%u helpers_created=%u participants: 1=%llu 2=%llu 3=%llu 4=%llu 5=%llu 6=%llu 7=%llu 8=%llu\n",
+            s_vertex_request, s_vertex_pool.count,
+            (unsigned long long)s_vertex_participation[1], (unsigned long long)s_vertex_participation[2],
+            (unsigned long long)s_vertex_participation[3], (unsigned long long)s_vertex_participation[4],
+            (unsigned long long)s_vertex_participation[5], (unsigned long long)s_vertex_participation[6],
+            (unsigned long long)s_vertex_participation[7], (unsigned long long)s_vertex_participation[8]);
+    fprintf(stderr,"[VERTEX121] serial_request=%d small=%llu eligible=%llu max_unique=%llu threshold=%u; waits=condition-variable (no spin)\n",
+        s_vertex_request==1,(unsigned long long)s_vertex_small,(unsigned long long)s_vertex_eligible,(unsigned long long)s_vertex_max,s_vertex_pool.min_batch?s_vertex_pool.min_batch:NV_VERTEX_MIN_BATCH);
+    s_vertex_small=s_vertex_eligible=s_vertex_max=0;
+    memset(s_vertex_participation, 0, sizeof s_vertex_participation);
+}
+
+static void android_vertex_pool_cleanup(void) { nv_vertex_pool_stop(&s_vertex_pool); pack_free138(&s_pack138); }
+static unsigned android_vertex_threads(void)
+{
+    if (!s_vertex_configured) {
+        const char *e = getenv("RECOMP_VERTEX_THREADS");
+        s_vertex_configured = 1;
+        s_vertex_request = e && e[0] >= '1' && e[0] <= '8' && !e[1] ? (unsigned)(e[0] - '0') : 1;
+        e = getenv("RECOMP_RENDER_FAST");
+        s_vertex_fast = !e || strcmp(e, "0");
+        atexit(android_vertex_pool_cleanup);
+        /* Lazy workers: a below-threshold batch must never create an idle helper. */
+        s_vertex_request=defjam_sched_vertex_participants(s_vertex_request);
+        s_vertex_pool.min_batch=defjam_sched_vertex_threshold();
+        s_pack_enabled138=defjam_sched_vertex_cache141();
+        {const char *a24=getenv("DEFJAM_PACK_ADAPT24");s_pack138.adaptive24=!a24||strcmp(a24,"0");}
+        fprintf(stderr,"[OPT24] adaptive_pack=%d cache_enabled=%d; async/render_fast unchanged; exact-byte validation, uncached fallback\n",s_pack138.adaptive24,s_pack_enabled138);
+        fprintf(stderr, "[ANDROID-VERTEX] requested %u participants; minimum batch %u vertices\n",
+                s_vertex_request, s_vertex_pool.min_batch);
+    }
+    return s_vertex_request;
+}
+static PackEntry138 *android_pack_probe138(const NvAndroidGatherJob *j,uint32_t total,int *hit){
+    *hit=0;if(!s_pack_enabled138||!j->fast||!total)return NULL;
+    uint32_t min=UINT32_MAX,max=0;
+    for(uint32_t i=0;i<total;i++){uint32_t v=j->indices[i];if(v<min)min=v;if(v>max)max=v;}
+    struct {VertexAttr attr[16];float current[16][4];uint32_t used,per,total,fast,inline_active;} key;
+    memset(&key,0,sizeof key);memcpy(key.attr,j->attr,sizeof key.attr);memcpy(key.current,j->current,sizeof key.current);
+    key.used=j->used;key.per=j->per;key.total=total;key.fast=j->fast;key.inline_active=j->inline_active;
+    PackSegment138 seg[18]={{&key,sizeof key},{j->indices,(size_t)total*sizeof(uint32_t)}};unsigned count=2;
+    for(unsigned a=0;a<16;a++)if((j->used>>a)&1){
+        const VertexAttr *v=&j->attr[a];if(!v->size||!v->stride)continue;
+        if(v->type!=0&&v->type!=1&&v->type!=2&&v->type!=4&&v->type!=5&&v->type!=6){s_pack138.bypassed++;return NULL;}
+        uint32_t components=v->size<4?v->size:4;
+        uint64_t bytes=v->type==2?components*4u:v->type==1||v->type==5?components*2u:v->type==4?components:4u;
+        /* Original decoder validates16 bytes on non-inline input, including for
+         * short attributes. Match that predicate; never read an unvalidated span. */
+        uint64_t first=(uint64_t)v->offset+(uint64_t)min*v->stride,last=(uint64_t)v->offset+(uint64_t)max*v->stride;
+        const uint8_t *base;
+        if(j->inline_active){
+            uint64_t length=(uint64_t)j->inline_count*4;
+            if(last>length||bytes>length-last){s_pack138.bypassed++;return NULL;}
+            base=(const uint8_t *)j->inline_buf;
+        }else{
+            if(!v->offset||!((first>=0x1000u&&last+16<=0x04000000u)||(first>=0x80000000u&&last+16<=0x84000000u))){s_pack138.bypassed++;return NULL;}
+            base=j->mem;
+        }
+        uint64_t length=last-first+bytes;if(length>PACK138_INPUT){s_pack138.bypassed++;return NULL;}
+        uintptr_t begin=(uintptr_t)base+first,end=begin+(size_t)length;
+        /* Interleaved attributes share the same byte spans; snapshot each byte
+         * once rather than keeping16 copies of the same static vertex buffer. */
+        for(unsigned k=2;k<count;){
+            uintptr_t lo=(uintptr_t)seg[k].data,hi=lo+seg[k].size;
+            if(begin<=hi&&lo<=end){
+                if(lo<begin)begin=lo;if(hi>end)end=hi;
+                seg[k]=seg[--count];k=2;
+            }else k++;
+        }
+        seg[count++]=(PackSegment138){(const void *)begin,(size_t)(end-begin)};
+    }
+    /* Black records compact state/resource keys instead of rehashing all
+     * payload bytes for each command. Adapt that idea to the existing PB
+     * executor: only metadata picks a bucket; every source/index byte still
+     * goes through pack_probe138's exact memcmp before reuse. No sampled hash. */
+    uint64_t hash=((uint64_t)j->used<<32)^total^((uint64_t)j->per<<16);
+    for(unsigned a=0;a<16;a++)if((j->used>>a)&1){
+        const VertexAttr *v=&j->attr[a];
+        uint64_t k=((uint64_t)v->offset<<32)^v->stride^((uint64_t)v->type<<24)^((uint64_t)v->size<<48);
+        hash^=k+0x9e3779b97f4a7c15ull+(hash<<6)+(hash>>2);
+    }
+    return pack_probe138(&s_pack138,hash,seg,count,(size_t)total*j->per*16,j->out,hit);
+}
+static void android_gather_range(void *arg, uint32_t begin, uint32_t end)
+{
+    const NvAndroidGatherJob *job = (const NvAndroidGatherJob *)arg;
+    // The program's inputs do not change within a batch. Compact once per
+    // range instead of scanning all 16 possible inputs for every vertex.
+    uint8_t active[16];
+    const uint8_t *float_base[16] = {0};
+    uint8_t components[16] = {0};
+    uint32_t min_index = UINT32_MAX, max_index = 0;
+    uint32_t count = 0;
+    int has_float_stream = 0;
+    if (begin >= end) return;
+    for (uint32_t a = 0; a < 16; ++a)
+        if ((job->used >> a) & 1) {
+            active[count++] = (uint8_t)a;
+            if (job->attr[a].type == 2 && job->attr[a].size && job->attr[a].stride)
+                has_float_stream = 1;
+        }
+    if (job->fast && has_float_stream) {
+        /* Classify immutable stream formats once per range, as Black's
+         * assembled vertex descriptions do. A valid float stream can be
+         * copied directly; no per-component decode or repeated VA check.
+         * Other formats and any questionable span keep the original decoder. */
+        for (uint32_t v = begin; v < end; ++v) {
+            uint32_t index = job->indices[v];
+            if (index < min_index) min_index = index;
+            if (index > max_index) max_index = index;
+        }
+        for (uint32_t k = 0; k < count; ++k) {
+            const VertexAttr *a = &job->attr[active[k]];
+            uint32_t n = a->size < 4 ? a->size : 4;
+            uint64_t first = (uint64_t)a->offset + (uint64_t)min_index * a->stride;
+            uint64_t last = (uint64_t)a->offset + (uint64_t)max_index * a->stride;
+            if (a->type != 2 || !n || !a->stride) continue;
+            if (job->inline_active) {
+                uint64_t length = (uint64_t)job->inline_count * 4;
+                if (last > length || n * 4 > length - last) continue;
+                float_base[k] = (const uint8_t *)job->inline_buf + a->offset;
+            } else {
+                if (!a->offset || !((first >= 0x1000u && last + 16 <= 0x04000000u)
+                        || (first >= 0x80000000u && last + 16 <= 0x84000000u))) continue;
+                float_base[k] = (const uint8_t *)((uintptr_t)job->mem + a->offset);
+            }
+            components[k] = (uint8_t)n;
+        }
+        /* Adjacent float4 inputs already have the packed layout Vulkan
+         * consumes. Copy one whole vertex instead of decoding each input.
+         * Keep a constant copy size for the common one-to-four-input cases. */
+        int merged = count != 0 && job->per == count;
+        for (uint32_t k = 0; k < count; ++k)
+            if (components[k] != 4 || !float_base[0]
+                    || float_base[k] != float_base[0] + k * 16
+                    || job->attr[active[k]].stride != job->attr[active[0]].stride)
+                merged = 0;
+        if (merged) {
+            uint32_t stride = job->attr[active[0]].stride;
+#define COPY_FLOAT_VERTEX(BYTES) \
+            for (uint32_t v = begin; v < end; ++v) \
+                memcpy(job->out + (size_t)v * job->per * 4, \
+                       float_base[0] + (size_t)job->indices[v] * stride, (BYTES))
+            switch (count) {
+            case 1: COPY_FLOAT_VERTEX(16); break;
+            case 2: COPY_FLOAT_VERTEX(32); break;
+            case 3: COPY_FLOAT_VERTEX(48); break;
+            case 4: COPY_FLOAT_VERTEX(64); break;
+            default: COPY_FLOAT_VERTEX((size_t)count * 16); break;
+            }
+#undef COPY_FLOAT_VERTEX
+            return;
+        }
+    }
+    for (uint32_t v = begin; v < end; ++v) {
+        float *dst = job->out + (size_t)v * job->per * 4;
+        uint32_t index = job->indices[v];
+        for (uint32_t k = 0; k < count; ++k) {
+            uint32_t a = active[k];
+            if (float_base[k]) {
+                float *value = dst + k * 4;
+                const uint8_t *p = float_base[k] + (size_t)index * job->attr[a].stride;
+                if (components[k] == 4) {
+                    memcpy(value, p, 16);
+                } else {
+                    value[0] = value[1] = value[2] = 0.0f; value[3] = 1.0f;
+                    memcpy(value, p, (size_t)components[k] * sizeof(float));
+                }
+            } else if (!fetch_attr_from(&job->attr[a], index, dst + k * 4, job->mem,
+                                 job->inline_active, job->inline_buf, job->inline_count, 0))
+                memcpy(dst + k * 4, job->current[a], 4 * sizeof(float));
+        }
+        if (!count) { dst[0] = dst[1] = dst[2] = 0.0f; dst[3] = 1.0f; }
+    }
+}
+#endif
 
 /* Widescreen 2D placement (docs/widescreen in the Def Jam port).
  *
@@ -1063,7 +1310,7 @@ static void clear_surface(uint32_t param)
     /* Progress markers, interleaved with everything else in the log. The
      * summary says drawing stopped; only a marker next to the surrounding
      * activity says what the title was doing when it stopped. */
-    if ((s_gpu.clears % 100) == 0)
+    if (pb_exec_verbose() && (s_gpu.clears % 100) == 0)
         fprintf(stderr, "  [GPU] clear #%u\n", s_gpu.clears);
     /* Distinct clear colours actually used. "Cleared to black" and "the clear
      * never ran" look identical in the framebuffer, and only one of them is a
@@ -2717,7 +2964,7 @@ static void raster_batch(void)
         break;                             /* points and lines: not yet */
     }
 
-    if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
+    if (pb_exec_verbose() && s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
 
     /* Capture the surface while the geometry is still on it.
@@ -3062,7 +3309,7 @@ static void bind_texture_ready(const Texture *t)
     seen[slot].checked_ms = now;
     {
         static uint32_t expanded;
-        if (++expanded % 1000 == 0)
+        if (++expanded % 1000 == 0 && pb_exec_verbose())
             fprintf(stderr, "  [GPU] palettised textures expanded: %u\n", expanded);
     }
     {
@@ -3100,7 +3347,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    if (pb_exec_verbose() && (s_gpu.draws % 200) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -3273,6 +3520,8 @@ static void draw_primitive(void)
             }
             if (gpu) {
                 static uint32_t gm_tag[VC_SIZE], gm_gen[VC_SIZE], gm_cur;
+                uint64_t pf_g0 = defjam_pf_now();
+                unsigned gather123=dj_trace(DJ_GATHER);
                 static uint16_t gm_val[VC_SIZE];
                 static uint16_t lidx[NV_MAX_INDICES];
                 uint32_t k, cnt = s_gpu.idx_count < NV_MAX_INDICES ? s_gpu.idx_count : NV_MAX_INDICES;
@@ -3280,6 +3529,51 @@ static void draw_primitive(void)
                     memset(gm_gen, 0, sizeof(gm_gen));
                     gm_cur = 1;
                 }
+#if defined(__ANDROID__)
+                {
+                    static uint32_t unique[NV_MAX_INDICES];
+                    NvAndroidGatherJob job;
+                    uint32_t per = 0;
+                    unsigned parts;
+                    unsigned requested = android_vertex_threads();
+                    for (k = 0; k < cnt; ++k) {
+                        uint32_t vi = s_gpu.idx[k], slot = vi & (VC_SIZE - 1);
+                        if (gm_gen[slot] == gm_cur && gm_tag[slot] == vi) {
+                            lidx[k] = gm_val[slot]; continue;
+                        }
+                        unique[gnv] = vi;
+                        gm_tag[slot] = vi; gm_gen[slot] = gm_cur;
+                        gm_val[slot] = lidx[k] = (uint16_t)gnv++;
+                    }
+                    for (k = 0; k < 16; ++k) per += (used >> k) & 1;
+                    memset(&job, 0, sizeof job);
+                    memcpy(job.attr, s_gpu.attr, sizeof job.attr);
+                    memcpy(job.current, s_gpu.imm_attr, sizeof job.current);
+                    job.mem = (const uint8_t *)xbox_GetMemoryOffset();
+                    job.inline_active = s_gpu.inline_active;
+                    job.fast = s_vertex_fast;
+                    job.inline_buf = s_gpu.inline_buf; job.inline_count = s_gpu.inline_count;
+                    job.indices = unique; job.used = used; job.per = per ? per : 1; job.out = gv;
+                    if(gnv>s_vertex_max)s_vertex_max=gnv;
+                    if(gnv<s_vertex_pool.min_batch)++s_vertex_small;else ++s_vertex_eligible;
+                    int hit138=0;
+                    PackEntry138 *cache138=android_pack_probe138(&job,gnv,&hit138);
+                    if(hit138)parts=1;
+                    else{
+                        parts = nv_vertex_pool_run(&s_vertex_pool, requested, gnv,
+                                                   android_gather_range, &job);
+                        pack_commit138(cache138,job.out);
+                    }
+                    if (parts >= 1 && parts <= 8) ++s_vertex_participation[parts];
+                    if (parts > 1) {
+                        s_vertex_parallel_vertices += gnv;
+                        if (++s_vertex_parallel_batches == 1 || s_vertex_parallel_batches % 600 == 0)
+                            fprintf(stderr, "[ANDROID-VERTEX] %u participants, %llu batches / %llu vertices processed in parallel\n",
+                                    parts, (unsigned long long)s_vertex_parallel_batches,
+                                    (unsigned long long)s_vertex_parallel_vertices);
+                    }
+                }
+#else
                 for (k = 0; k < cnt; k++) {
                     uint32_t vi = s_gpu.idx[k], slot = vi & (VC_SIZE - 1), a;
                     if (gm_gen[slot] == gm_cur && gm_tag[slot] == vi) {
@@ -3315,6 +3609,21 @@ static void draw_primitive(void)
                     for (v2 = 1; v2 < gnv; v2++)
                         memmove(gv + (size_t)v2 * per * 4, gv + (size_t)v2 * 64, per * 16);
                 }
+#endif
+                dj_trace_end(gather123);
+                uint64_t gather_end138=defjam_pf_now();
+                g_pf_gather_ns += gather_end138 - pf_g0;
+#if defined(__ANDROID__)
+                defjam_perf138_gather(gather_end138-pf_g0,s_vertex_pool.count);
+                if(!s_pack_log138)s_pack_log138=gather_end138;
+                if(gather_end138-s_pack_log138>=10000000000ull){
+                    fprintf(stderr,"[PACK139-10S] hits=%llu misses=%llu bypass=%llu bounded_bytes=%zu; metadata bucket, exact input validation; no draw fusion\n",
+                        (unsigned long long)s_pack138.hits,(unsigned long long)s_pack138.misses,(unsigned long long)s_pack138.bypassed,s_pack138.entry?PACK138_SLOTS*sizeof(PackEntry138):0);
+                    fprintf(stderr,"[PACK24-10S] adaptive=%d cooldown_bypass=%llu input_snapshot_bytes=%llu cache_hit_copy_bytes=%llu avoided_input_snapshot_bytes=%llu avoided_output_snapshot_bytes=%llu; counters since previous report, no skipped geometry\n",s_pack138.adaptive24,(unsigned long long)s_pack138.adaptive_skips24,(unsigned long long)s_pack138.input_copied24,(unsigned long long)s_pack138.hit_copied24,(unsigned long long)s_pack138.avoided_input24,(unsigned long long)s_pack138.avoided_output24);
+                    s_pack138.adaptive_skips24=s_pack138.input_copied24=s_pack138.hit_copied24=s_pack138.avoided_input24=s_pack138.avoided_output24=0;
+                    s_pack138.hits=s_pack138.misses=s_pack138.bypassed=0;s_pack_log138=gather_end138;
+                }
+#endif
                 /* Every primitive as a triangle list. Nothing is culled, so
                  * winding does not matter: this title leaves face culling off
                  * (the batch dump's "cull 0" on every batch, menus to fights). */
@@ -3623,7 +3932,14 @@ static void draw_primitive(void)
                     ws_place_batch(vsh, used, gpu ? NULL : ready, n);
                 if (n >= 3 && gpu) {
                     pgraph_d3d11_set_point_mode(s_gpu.prim == 1, s_point_size);
-                    (void)pgraph_d3d11_draw_program(gv, gnv, used, gtri, gnt, gsu, gsv);
+                    {
+                        uint64_t pf_d0 = defjam_pf_now();
+                        unsigned draw123=dj_trace(DJ_DRAW);
+                        (void)pgraph_d3d11_draw_program(gv, gnv, used, gtri, gnt, gsu, gsv);
+                        dj_trace_end(draw123);
+                        g_pf_draw_ns += defjam_pf_now() - pf_d0;
+                        g_pf_batches++;
+                    }
                     pgraph_d3d11_set_point_mode(0, 0.0f);
                 }
                 else if (n >= 3)
@@ -4020,11 +4336,18 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     record_tex_reg(method, param);
 }
 
+static int s_exec_inited;
+static int pb_d3d11_forwarding(void)
+{
+    static int fwd = -1;
+    if (fwd < 0) fwd = getenv("RECOMP_PB_D3D11") != NULL;
+    return fwd;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
-    static int inited;
-    if (!inited) {
-        inited = 1;
+    if (!s_exec_inited) {
+        s_exec_inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
         {
             int i;
@@ -4085,13 +4408,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * needs a D3D11 device to exist, which the host program creates. With no
      * device the translator does nothing and the software path still runs, so
      * enabling it cannot make things worse than they were. */
-    {
-        static int fwd = -1;
-        if (fwd < 0)
-            fwd = getenv("RECOMP_PB_D3D11") != NULL;
-        if (fwd)
-            pgraph_d3d11_method((int)subch, method, param);
-    }
+    if (pb_d3d11_forwarding())
+        pgraph_d3d11_method((int)subch, method, param);
     if (subch == 0 && method >= 0x300 && method <= 0x3FC)
         RS(method) = param;
     if (subch == 0) {
@@ -4512,6 +4830,40 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     }
 }
+
+#if defined(__ANDROID__)
+/* A non-increasing index packet carries no state transitions between its
+ * words. Append it together instead of traversing the general method switch
+ * and the legacy translator once per pair. Parser validates mapping/PUT;
+ * this function validates executor state/capacity. Overflow/debug paths use
+ * the original scalar implementation, including its warnings. */
+int nv2a_pb_exec_index_packet(uint32_t subch, uint32_t method,
+                             const uint32_t *params, uint32_t count)
+{
+    uint32_t per = method == NV097_ARRAY_ELEMENT16 ? 2u : 1u;
+    if (subch != 0 || (method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32)
+            || !params || !count || !s_exec_inited || s_ftrace || pb_exec_verbose()) return 0;
+    if (s_gpu.prim && ((uint64_t)s_gpu.idx_count + (uint64_t)count * per > NV_MAX_INDICES))
+        return 0;
+    if (pb_d3d11_forwarding()) pgraph_d3d11_note_index_words(count);
+    if (s_gpu.prim) {
+        uint32_t *out = s_gpu.idx + s_gpu.idx_count;
+        if (per == 2) {
+            for (uint32_t k = 0; k < count; ++k) {
+                uint32_t word = params[k];
+                out[k * 2] = word & 0xFFFFu;
+                out[k * 2 + 1] = word >> 16;
+            }
+        } else {
+            memcpy(out, params, (size_t)count * sizeof *params);
+        }
+        s_gpu.idx_count += count * per;
+    }
+    ++s_index_bulk_packets;
+    s_index_bulk_words += count;
+    return 1;
+}
+#endif
 
 /* Find where the title actually wrote its quad.
  *

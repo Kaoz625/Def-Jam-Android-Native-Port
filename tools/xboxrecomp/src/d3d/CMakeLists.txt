@@ -30,9 +30,18 @@ else()
     # shaderc: found without pkg-config first, so a prefix that ships only the
     # library and its header (a bundled runtime, a machine with no package
     # manager) is enough. pkg-config remains the fallback.
-    find_library(SHADERC_LIBRARY NAMES shaderc_shared shaderc_shared.1 shaderc)
-    find_path(SHADERC_INCLUDE_DIR shaderc/shaderc.h)
-    if(SHADERC_LIBRARY AND SHADERC_INCLUDE_DIR)
+    if(XBOXRECOMP_SHADERC_TARGET AND TARGET ${XBOXRECOMP_SHADERC_TARGET})
+        set(SHADERC_FOUND TRUE)
+        set(SHADERC_VERSION "provided target ${XBOXRECOMP_SHADERC_TARGET}")
+        set(XBOX_SHADERC_TARGET ${XBOXRECOMP_SHADERC_TARGET})
+    else()
+        find_library(SHADERC_LIBRARY NAMES shaderc_shared shaderc_shared.1 shaderc)
+        find_path(SHADERC_INCLUDE_DIR shaderc/shaderc.h)
+    endif()
+    if(XBOXRECOMP_SHADERC_TARGET AND TARGET ${XBOXRECOMP_SHADERC_TARGET})
+        # Android supplies a local arm64 package from the app's vendor
+        # directory. The imported shared target is packaged beside libmain.so.
+    elseif(SHADERC_LIBRARY AND SHADERC_INCLUDE_DIR)
         add_library(xbox_shaderc INTERFACE)
         target_link_libraries(xbox_shaderc INTERFACE "${SHADERC_LIBRARY}")
         target_include_directories(xbox_shaderc INTERFACE "${SHADERC_INCLUDE_DIR}")
@@ -51,7 +60,12 @@ else()
             d3d8_formats.c
             d3d8_combiners.c
         )
-        target_link_libraries(xbox_d3d8 PUBLIC platform Vulkan::Vulkan ${XBOX_SHADERC_TARGET})
+        if(ANDROID AND TARGET defjam_volk AND TARGET adrenotools)
+            target_link_libraries(xbox_d3d8 PUBLIC platform defjam_volk adrenotools ${XBOX_SHADERC_TARGET})
+            target_compile_definitions(xbox_d3d8 PUBLIC VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR)
+        else()
+            target_link_libraries(xbox_d3d8 PUBLIC platform Vulkan::Vulkan ${XBOX_SHADERC_TARGET})
+        endif()
         target_compile_definitions(xbox_d3d8 PUBLIC XBOXRECOMP_HAVE_VULKAN=1)
         message(STATUS "xbox_d3d8: Vulkan device (shaderc ${SHADERC_VERSION})")
     elseif(XBOXRECOMP_SDL3)

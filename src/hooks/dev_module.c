@@ -150,6 +150,10 @@ void dev_module_after_call(const char *text)
 {
     char low[160];
     size_t i;
+#if defined(__ANDROID__)
+    extern void defjam_android_note_frontend_call(const char *text);
+    defjam_android_note_frontend_call(text);
+#endif
     if (s_mode < 0) read_env();
     if (!text) return;
     for (i = 0; text[i] && i + 1 < sizeof low; i++) low[i] = (char)tolower((unsigned char)text[i]);
@@ -166,6 +170,28 @@ void dev_module_manager_enter(void)
     int i;
 
     if (s_mode < 0) read_env();
+#if defined(__ANDROID__)
+    {
+        extern void defjam_android_note_module(int type);
+        int type = -1;
+        if (mgr && MEM32(mgr + MGR_STATE) == 0 && MEM32(mgr + MGR_PENDING) == 0)
+            type = module_type(MEM32(mgr + MGR_CURRENT));
+        defjam_android_note_module(type);
+        {
+            extern void defjam_android_note_pause_menu(uint32_t object, uint32_t state);
+            /* The module owns CPausedMenu at +3C (779F0 -> CCE60). Its renderer
+             * CE200 exits immediately when object+24 is zero; 77A40 also uses
+             * that same field to suspend normal module work. Unlike the old
+             * match freeze mask, this describes the actual menu, including
+             * subpages and opening/closing transitions. No guest state is written. */
+            uint32_t module = type >= 0 ? MEM32(mgr + MGR_CURRENT) : 0;
+            uint32_t pause = module ? MEM32(module + 0x3Cu) : 0;
+            uint32_t state = pause ? MEM32(pause + 0x24u) : 0;
+            if (MEM32(0x0039C0C0u) & 0x40u) state = 0; /* same render gate as 77B20 */
+            defjam_android_note_pause_menu(pause, state);
+        }
+    }
+#endif
     if (!mgr || MEM32(mgr + MGR_STATE) != 0 || MEM32(mgr + MGR_PENDING) != 0) return;
     if (s_leave && MEM32(mgr + MGR_CURRENT) == s_object) {
         /* Back to the front end: a game, Story or gym module cannot simply be re-entered (their own
