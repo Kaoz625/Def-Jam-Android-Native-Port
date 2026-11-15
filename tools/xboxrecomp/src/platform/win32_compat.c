@@ -38,6 +38,15 @@ typedef int xbox_guest_write_scope131;
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
+#if defined(__ANDROID__)
+/* [android] Bionic has no pthread_{get,set}affinity_np: the thread's kernel id and
+ * sched_{get,set}affinity do the same (blz/android-1.1.2). */
+#include <unistd.h>
+static inline int pthread_setaffinity_np(pthread_t th, size_t n, const cpu_set_t *set)
+{ return sched_setaffinity(pthread_gettid_np(th), n, set) == 0 ? 0 : -1; }
+static inline int pthread_getaffinity_np(pthread_t th, size_t n, cpu_set_t *set)
+{ return sched_getaffinity(pthread_gettid_np(th), n, set) == 0 ? 0 : -1; }
+#endif
 #include <fenv.h>
 #include <sys/mman.h>
 #if defined(__ANDROID__)
