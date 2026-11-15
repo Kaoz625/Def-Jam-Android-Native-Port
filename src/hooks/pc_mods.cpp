@@ -272,7 +272,17 @@ extern "C" int pc_mods_game_lock(void) {
 #else
     static int lock = -1;
     lock = open(path.c_str(),O_RDWR|O_CREAT|O_CLOEXEC,0600);
-    if (lock < 0 || flock(lock,LOCK_SH|LOCK_NB)) { if (lock >= 0) close(lock); lock = -1; return 0; }
+    if (lock < 0) return 0;
+    if (flock(lock,LOCK_SH|LOCK_NB)) {
+#if defined(__ANDROID__)
+        // [android] Shared storage (/storage/emulated, FUSE) may refuse flock outright; only
+        // "held by someone else" means an installer is running (no CLI installer on Android).
+        if (errno == EWOULDBLOCK) { close(lock); lock = -1; return 0; }
+        fprintf(stderr,"[MODS] flock unsupported here (errno %d); playing without the mod lock\n",errno);
+#else
+        close(lock); lock = -1; return 0;
+#endif
+    }
 #endif
     // Recheck after acquiring the lock: an installer may have crashed between
     // the first journal check and this acquisition.
