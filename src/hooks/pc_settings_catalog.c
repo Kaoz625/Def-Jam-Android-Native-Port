@@ -33,7 +33,79 @@ static const char *const k_ws_hud[] = { "auto", "edges", "centered", NULL };
 static const char *const k_ws_cutscenes[] = { "authored", "fill", NULL };
 static const char *const k_ws_fill[] = { "blur", "black", NULL };
 
+/* [android] contatg's Android 1.4 defaults: 1x (480p) render scale, no vsync pacing, plus its
+ * Android-only graphics/scheduler keys (read by the Android renderer and the launcher). */
+#if defined(__ANDROID__)
+#define RENDER_DEFAULT145 1
+#define VSYNC_DEFAULT145 0
+#else
+#define RENDER_DEFAULT145 2
+#define VSYNC_DEFAULT145 1
+#endif
+static const char *const k_android_profile[] = {"auto","low-end","normal",NULL};
 static RecompSetting g_display_settings[] = {
+#if defined(__ANDROID__)
+    {"graphics","preset145",RECOMP_SETTING_INT,0,0,3,NULL,NULL,0,"In-game graphics preset:0 custom,1 performance,2 balanced,3 quality. Does not change simulation."},
+    {"graphics","fxaa145",RECOMP_SETTING_INT,-1,-1,1,NULL,NULL,0,"-1 inherits previous Android FXAA choice;0 off,1 on. Live in-game graphics menu."},
+    {"graphics","hud145",RECOMP_SETTING_INT,-1,-1,1,NULL,NULL,0,"-1 inherits previous Android FPS counter choice;0 off,1 on."},
+    {"graphics","hud_position145",RECOMP_SETTING_INT,0,0,2,NULL,NULL,0,"0 top-right,1 top-center,2 top-left."},
+    {"graphics","precise_barriers144",RECOMP_SETTING_BOOL,1,0,0,NULL,"RECOMP_VK_BARRIERS144",RECOMP_SETTING_RESTART,"Layout-specific Vulkan barriers; conservative GPU mode retains broad dependencies."},
+    {"graphics","fsr144",RECOMP_SETTING_INT,0,0,1,NULL,"RECOMP_VK_FSR144",RECOMP_SETTING_RESTART,"AMD FSR1 EASU+RCAS presentation upscaling. Optional GPU cost; no frame generation."},
+    {"graphics","screen_filter144",RECOMP_SETTING_INT,0,0,5,NULL,"RECOMP_VK_FILTER144",RECOMP_SETTING_RESTART,"0 original,1 sharpen,2 vivid,3 scanlines,4 CRT,5 tone mapping (SDR)."},
+    {"graphics","spatial34",RECOMP_SETTING_INT,0,0,2,NULL,"RECOMP_VK_SPATIAL34",RECOMP_SETTING_RESTART,"Presentation upscaler: 0 original, 1 Catmull-Rom bicubic, 2 Lanczos-2; independent of guest. Restart required."},
+    {"graphics","anisotropy144",RECOMP_SETTING_INT,1,1,16,NULL,"RECOMP_VK_ANISO144",RECOMP_SETTING_RESTART,"Optional linear mipmapped texture filtering, limited to device support."},
+    {"graphics","shader_preload144",RECOMP_SETTING_INT,1,0,1,NULL,"RECOMP_VK_PRELOAD144",RECOMP_SETTING_RESTART,"Bounded startup warm-up of prior-run shaders/pipelines; first run learns."},
+    {"graphics","fsr_sharpness144",RECOMP_SETTING_INT,80,0,200,NULL,"RECOMP_VK_SHARPNESS144",RECOMP_SETTING_RESTART,"RCAS attenuation in hundredths of a stop:0 strongest,200 softer."},
+    {"vksched","profile",RECOMP_SETTING_ENUM,0,0,0,k_android_profile,NULL,RECOMP_SETTING_RESTART,"Presentation preset. No guest simulation changes."},
+    {"vksched","present_limit",RECOMP_SETTING_INT,-1,-1,60,NULL,NULL,RECOMP_SETTING_RESTART,"-1 auto/launcher,0 original,30/60 host ceiling."},
+    {"vksched","menus_limit",RECOMP_SETTING_INT,60,0,120,NULL,NULL,RECOMP_SETTING_RESTART,"Auto profile: menu cap. Movies keep their authored cadence."},
+    {"vksched","exclude_prime34",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Weak-phone preset: guest and native threads avoid the fastest CPU where supported."},
+    {"vksched","kernel_log26",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"0: disable xbox_log before timestamp/format/locking and do not create xbox_kernel.log;1 restore diagnostic logger;restart required."},
+    {"graphics","fg_engine39",RECOMP_SETTING_INT,0,0,2,NULL,NULL,RECOMP_SETTING_RESTART,"0 off, 1 Win-FG v37, 2 Lossless LSFG. Combat only."},
+    {"graphics","framegen34",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Lossless Scaling 3.1 Performance frame generation; presentation only."},
+    {"graphics","framegen27",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Optional native LSFG3.1 Performance x2/x3/x4 from user-imported Lossless shaders. Default OFF; adds video latency; no extra simulation steps."},
+    {"graphics","lsfg32_height",RECOMP_SETTING_INT,480,240,960,NULL,"DEFJAM_LSFG32_HEIGHT",RECOMP_SETTING_RESTART,"Private LSFG snapshot height limit; preserves game render resolution. Default480."},
+    {"graphics","lsfg30_multiplier",RECOMP_SETTING_INT,2,2,4,NULL,"DEFJAM_LSFG30_MULTIPLIER",RECOMP_SETTING_RESTART,"LSFG generated presentation multiplier:2/3/4. GPU and display can limit effective ratio."},
+    {"graphics","lsfg30_refresh",RECOMP_SETTING_INT,60,60,120,NULL,"DEFJAM_LSFG30_REFRESH",RECOMP_SETTING_RESTART,"LSFG output ceiling:60/90/120Hz, if supported by the display."},
+    {"graphics","lsfg27_flow",RECOMP_SETTING_INT,25,25,100,NULL,NULL,RECOMP_SETTING_RESTART,"LSFG optical-flow resolution percentage;25 low-cost default,50/100 optional. Does not change game resolution."},
+    {"graphics","lsfg27_fp16",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Request FP16 LSFG shaders only if the Turnip device supports the feature; FP32 fallback. Restart required."},
+    {"graphics","lsfg27_gpu_budget_us",RECOMP_SETTING_INT,4000,2000,8000,NULL,NULL,RECOMP_SETTING_RESTART,"Auto-disable framegen after12 GPU EWMA samples above this budget in microseconds; default4000."},
+    {"graphics","lsfg27_budget_guard",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Pause FG when GPU budget is exceeded; 0 disables the budget guard."},
+    {"graphics","lsfg27_warmup_samples",RECOMP_SETTING_INT,60,0,600,NULL,NULL,RECOMP_SETTING_RESTART,"Generated-frame GPU samples ignored after startup; default 60."},
+    {"graphics","lsfg27_budget_retry_s",RECOMP_SETTING_INT,45,0,600,NULL,NULL,RECOMP_SETTING_RESTART,"Seconds before retry after GPU budget pause; 0 makes it permanent."},
+    {"graphics","lsfg33_slow_guard",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Suspend FG below 20 fps; 0 allows low-source generation down to about 10 fps."},
+    {"graphics","framegen26",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Experimental Vulkan image-based optical flow, combat only,60Hz presentation; adds20-60ms buffering; default OFF. Real FPS/simulation unchanged."},
+    {"vksched","power25",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Power management and bounded1Hz observations."},
+    {"vksched","adpf25",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Request Android performance hints; APIs may be unavailable; original simulation unchanged."},
+    {"vksched","power_log25",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Monitor-thread CPU,temperature,cooling,headroom1Hz; no per-frame proc reads."},
+    {"vksched","sustained25",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Request sustained performance when the device supports it; OS selects clocks."},
+    {"vksched","display_rate25",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Request60Hz for60fps;120Hz for40fps when compatible display modes exist."},
+    {"vksched","affinity25",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Opt-in fixed native placement:render6,helpers4/5,mixer2or3; original allowed mask respected."},
+    {"vksched","guest_worker_affinity",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Experimental guest workers5,IRQ4; timing not validated; restart required."},
+    {"vksched","eco_resolution25",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Opt-in low-end boot at480p,aniso1,FSRoff,aspect preserved."},
+    {"vksched","dynamic_resolution25",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Headroom>=.85 for5s requests480p active region; requires direct presentation; original allocation retained."},
+    {"vksched","thermal_cap40_25",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Opt-in40fps after480p and persistent heat; existing cadence guard remains; cannot meet17ms p95 at40fps."},
+    {"vksched","present_mode25",RECOMP_SETTING_INT,0,0,2,NULL,NULL,RECOMP_SETTING_RESTART,"0 preserve selection,1 FIFO,2 MAILBOX if available; device decides image count."},
+    {"vksched","swap_images25",RECOMP_SETTING_INT,0,0,5,NULL,NULL,RECOMP_SETTING_RESTART,"0 preserve previous minimum,3 or5 requested images, clamped to driver capabilities."},
+    {"vksched","mixer_cpu25",RECOMP_SETTING_INT,3,2,3,NULL,NULL,RECOMP_SETTING_RESTART,"Native placement only, no audio buffer/algorithm change."},
+    {"vksched","adaptive_pack24",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Bypass repeatedly missing packed-vertex buckets; exact validation on cache hits; original gather on bypass."},
+    {"vksched","program_index24",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Fixed exact-key program index; rebuild only on program creation/replacement."},
+    {"vksched","fine_scopes22",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Exclusive wall scopes; instrumentation overhead included."},
+    {"vksched","resources22",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Opt-in per-present /proc lane counters; measurable file IO overhead."},
+    {"vksched","telemetry22",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"One-second hardware telemetry on existing monitor thread."},
+    {"vksched","fifo22",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Force FIFO, request three images; restart, compare on device."},
+    {"vksched","pin_render22",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Opt-in render CPU6, helpers CPU5, only if in original allowed mask."},
+    {"vksched","vertex_min_batch",RECOMP_SETTING_INT,512,96,2048,NULL,NULL,RECOMP_SETTING_RESTART,"96/128/256/512/1024/2048. Default512; measure target-device cost."},
+    {"vksched","vertex_participants",RECOMP_SETTING_INT,4,0,8,NULL,NULL,RECOMP_SETTING_RESTART,"0/4: dispatcher plus three helpers; 1 serial; 2..8 total participants. Sleeping condition-variable waits."},
+    {"vksched","native_clock_hz140",RECOMP_SETTING_INT,60,60,60,NULL,NULL,RECOMP_SETTING_RESTART,"Legacy key retained: original guest clock only; native120 experiment removed."},
+    {"vksched","thermal_adaptive",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Legacy ignored key. No application thermal ceiling or thermal worker."},
+    {"vksched","vertex_cache",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Bounded exact-input packed vertex cache; verifies raw bytes on every hit."},
+    {"vksched","audio_buffer_ms",RECOMP_SETTING_INT,60,43,85,NULL,NULL,RECOMP_SETTING_RESTART,"Bounded SDL audio preroll. More buffer adds output latency, not missing samples."},
+    {"vksched","diagnostics",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Two-second frame windows; background reports every ten seconds."},
+    {"vksched","path_cache",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Read-only disc path/miss cache; writable saves excluded. Restart after importing files."},
+    {"vksched","hitch_details",RECOMP_SETTING_BOOL,1,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Bounded per-frame scope attribution; summaries every ten seconds."},
+    {"vksched","guest_samples",RECOMP_SETTING_BOOL,0,0,0,NULL,NULL,RECOMP_SETTING_RESTART,"Opt-in 100Hz guest-thread CPU sampling. Profiling has overhead."},
+#endif
     { "textures", "enabled", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, NULL, RECOMP_SETTING_RESTART,
       "Use texture packs from the data folder's mods directory." },
     { "textures", "packs", RECOMP_SETTING_STRING, 0, 0, 0, NULL, "RECOMP_TEXTURE_PACKS", RECOMP_SETTING_RESTART,
@@ -63,7 +135,11 @@ static RecompSetting g_display_settings[] = {
       "Beside 4:3 pictures (movies, menu backgrounds) in widescreen: a soft blurred extension, or black." },
     { "display", "widescreen_fov_cap", RECOMP_SETTING_INT, 150, 90, 170, NULL, NULL, RECOMP_SETTING_RESTART,
       "Widest horizontal field of view widescreen may use, in degrees (only very wide screens reach it)." },
-    { "display", "render_scale", RECOMP_SETTING_INT, 2, 1, 4, NULL, "RECOMP_RENDER_SCALE",
+#if defined(__ANDROID__)
+    { "display", "render_height151", RECOMP_SETTING_INT, 0, 0, 2160, NULL, NULL,
+      RECOMP_SETTING_RESTART, "Internal vertical resolution:480,540,720,960,1080,1440,1920,2160. 0 keeps legacy render_scale. Width follows aspect. Restart required." },
+#endif
+    { "display", "render_scale", RECOMP_SETTING_INT, RENDER_DEFAULT145, 1, 4, NULL, "RECOMP_RENDER_SCALE",
       RECOMP_SETTING_RESTART,
       "Internal render height: 1x = 480p, 2x = 960p, 3x = 1440p, 4x = 1920p. "
       "1080p output: 2x balances speed and clarity; 3x is sharper. 1440p output: 3x. "
@@ -81,7 +157,7 @@ static RecompSetting g_display_settings[] = {
     { "display", "anisotropy", RECOMP_SETTING_ENUM, 0, 0, 0, k_aniso, "RECOMP_ANISOTROPY", 0,
       "Anisotropic filtering: keeps floors and walls seen at a low angle sharp. Works best with the "
       "game's texture levels on." },
-    { "display", "vsync", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_PRESENT_VSYNC", 0,
+    { "display", "vsync", RECOMP_SETTING_BOOL, VSYNC_DEFAULT145, 0, 0, NULL, "RECOMP_PRESENT_VSYNC", 0,
       "Pace frames on the display for even motion. Used when the refresh rate is a multiple of 60 (60, 120, 180, 240 Hz); other displays use the game's own 60 fps timer." },
     { "display", "gamma", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_GAMMA",
       RECOMP_SETTING_RESTART,

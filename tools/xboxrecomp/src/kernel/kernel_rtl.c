@@ -238,6 +238,31 @@ static int          g_cs_table_full;
 static CRITICAL_SECTION g_cs_single;
 static INIT_ONCE g_cs_single_once = INIT_ONCE_STATIC_INIT;
 static int g_cs_single_mode = -1;
+#if defined(__ANDROID__)
+/* Slots are never erased or relocated. Each thread can remember the host
+ * lock after a protected lookup, without acquiring the global registry's
+ * reader lock again on every Enter/Leave. The actual recursive CS remains
+ * the synchronization primitive; this cache only resolves its address. */
+typedef struct { uintptr_t key; CRITICAL_SECTION *cs; } XBOX_CS_CACHE_ENTRY;
+static RECOMP_TLS XBOX_CS_CACHE_ENTRY t_cs_cache[64],t_cs_victim[64];
+static RECOMP_TLS int t_cs_mode_ready;
+static INIT_ONCE g_cs_mode_once = INIT_ONCE_STATIC_INIT;
+static int g_cs_cache_on;
+
+static BOOL CALLBACK xbox_cs_mode_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    const char *mode = getenv("RECOMP_CS_MODE");
+    const char *fast = getenv("RECOMP_CPU_FAST");
+    (void)o; (void)p; (void)c;
+    g_cs_single_mode = mode && !strcmp(mode, "single");
+    g_cs_cache_on = !fast || strcmp(fast, "0");
+    if (g_cs_single_mode)
+        fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock shares one recursive lock\n");
+    fprintf(stderr, "[ANDROID-CPU-FAST] critical-section lookup cache %s; recursive locks retained\n",
+            g_cs_cache_on ? "on" : "off");
+    return TRUE;
+}
+#endif
 
 static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -248,6 +273,12 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
 
 static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
+#if defined(__ANDROID__)
+    if (!t_cs_mode_ready) {
+        InitOnceExecuteOnce(&g_cs_mode_once, xbox_cs_mode_init, NULL, NULL);
+        t_cs_mode_ready = 1;
+    }
+#else
     if (g_cs_single_mode < 0) {
         const char* mode = getenv("RECOMP_CS_MODE");
         g_cs_single_mode = (mode && !strcmp(mode, "single")) ? 1 : 0;
@@ -255,6 +286,7 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
             fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
                             "shares one recursive lock\n");
     }
+#endif
     if (g_cs_single_mode) {
         if (!guest)
             return NULL;
@@ -267,6 +299,14 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 
     if (!key)
         return NULL;
+#if defined(__ANDROID__)
+    XBOX_CS_CACHE_ENTRY *cache = &t_cs_cache[((key >> 4) ^ (key >> 12)) & 63u];
+    XBOX_CS_CACHE_ENTRY *victim=&t_cs_victim[((key>>4)^(key>>12))&63u];
+    if(g_cs_cache_on){
+        if(cache->key==key)return cache->cs;
+        if(victim->key==key){XBOX_CS_CACHE_ENTRY old=*cache;*cache=*victim;*victim=old;return cache->cs;}
+    }
+#endif
     home = (size_t)((key >> 4) % XBOX_CS_TABLE_SIZE);
 
     /* Shared pass first: after start-up almost every call finds an existing
@@ -279,8 +319,12 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
         if (slot->key == 0) break;
     }
     ReleaseSRWLockShared(&g_cs_table_lock);
-    if (found)
+    if (found) {
+#if defined(__ANDROID__)
+        if (g_cs_cache_on) { *victim=*cache; cache->key = key; cache->cs = found; }
+#endif
         return found;
+    }
 
     AcquireSRWLockExclusive(&g_cs_table_lock);
     for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
@@ -296,6 +340,9 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
         }
     }
     ReleaseSRWLockExclusive(&g_cs_table_lock);
+#if defined(__ANDROID__)
+    if (found && g_cs_cache_on) { *victim=*cache; cache->key = key; cache->cs = found; }
+#endif
 
     if (!found && !g_cs_table_full) {
         g_cs_table_full = 1;
@@ -475,7 +522,11 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (!cs)
         return;
+    #if defined(__ANDROID__)
+    __atomic_fetch_add(&g_cs_enters,1,__ATOMIC_RELAXED);
+#else
     InterlockedIncrement(&g_cs_enters);
+#endif
     crt_lock_trace("take", CriticalSection);
     if (TryEnterCriticalSection(cs)) {
         xbox_cs_note_owner(cs);
@@ -528,7 +579,11 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (cs) {
-        InterlockedIncrement(&g_cs_leaves);
+        #if defined(__ANDROID__)
+    __atomic_fetch_add(&g_cs_leaves,1,__ATOMIC_RELAXED);
+#else
+    InterlockedIncrement(&g_cs_leaves);
+#endif
         crt_lock_trace("drop", CriticalSection);
         xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);

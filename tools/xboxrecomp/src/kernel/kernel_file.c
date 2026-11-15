@@ -16,6 +16,15 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#if defined(__ANDROID__)
+#include "platform/xbox_rollback_hooks.h"
+#include <pthread.h>
+#else
+#define xbox_notify_guest_write(host,length) ((void)0)
+typedef int xbox_guest_write_scope131;
+#define xbox_guest_write_begin131(host,length) 0
+#define xbox_guest_write_end131(scope) ((void)0)
+#endif
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1177,6 +1186,20 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             *slash = 0;
     }
 
+#if defined(__ANDROID__)
+    extern int xbox_android_path_cached_missing(void),xbox_android_path_is_disc(void);
+    extern void xbox_android_path_created(const char *);
+    int missing=xbox_android_path_cached_missing();
+    int readonly=CreateDisposition==XBOX_FILE_OPEN&&!(DesiredAccess&(XBOX_GENERIC_WRITE|XBOX_GENERIC_ALL|XBOX_FILE_WRITE_DATA|XBOX_FILE_APPEND_DATA))&&!(CreateOptions&XBOX_FILE_DIRECTORY_FILE);
+    /* DEFJAM_LANGUAGE37_READONLY: language packs never redirect writes or saves. */
+    extern int xbox_android_redirect_language_readonly(char *, DWORD);
+    if (readonly && xbox_android_redirect_language_readonly(host_path, MAX_PATH)) missing = 0;
+    if(readonly&&missing){
+        NTSTATUS status=errno_to_status(missing);
+        if(IoStatusBlock){IoStatusBlock->Status=status;IoStatusBlock->Information=0;}
+        return status;
+    }
+#endif
     int fd;
     /* A partition device opened as a directory: the volume, for a free-space
      * query, rather than the image's bytes. As in the Win32 backend, the
@@ -1231,16 +1254,28 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         {
             const char *xbox_path = get_xbox_path(ObjectAttributes);
+#if defined(__ANDROID__)
+            extern void xbox_android_path_open_failed(const char *,int);
+            if(readonly&&xbox_android_path_is_disc())xbox_android_path_open_failed(host_path,e);
+            if(!(xbox_android_path_is_disc()&&(e==ENOENT||e==ENOTDIR)))
+#endif
             fprintf(stderr, "  [FILE] %s -> not opened (%s: %s)\n",
                     xbox_path ? xbox_path : "?", host_path, strerror(e));
         }
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = errno_to_status(e);
             IoStatusBlock->Information = 0;
         }
         return st;
     }
 
+#if defined(__ANDROID__)
+    /* Opening a read-only directory does not modify the disc. It used to
+     * disable the entire path/miss cache at startup (cache_hits stayed0). */
+    if(CreateDisposition!=XBOX_FILE_OPEN ||
+       (DesiredAccess&(XBOX_GENERIC_WRITE|XBOX_GENERIC_ALL|XBOX_FILE_WRITE_DATA|XBOX_FILE_APPEND_DATA)))
+        xbox_android_path_created(host_path);
+#endif
     *FileHandle = w32_open_handle(fd, host_path);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1250,6 +1285,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
+#if defined(__ANDROID__)
+static void rollback_read_cleanup131(void *opaque){xbox_guest_write_end131(*(xbox_guest_write_scope131 *)opaque);}
+#endif
 NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
@@ -1269,7 +1307,15 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
-    ssize_t n = read(fd, Buffer, Length);
+    ssize_t n;
+#if defined(__ANDROID__)
+    xbox_guest_write_scope131 scope131=xbox_guest_write_begin131(Buffer, Length);
+    pthread_cleanup_push(rollback_read_cleanup131,&scope131);
+    n=read(fd, Buffer, Length);
+    pthread_cleanup_pop(1);
+#else
+    n=read(fd, Buffer, Length);
+#endif
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1340,8 +1386,13 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
-    if (unlink(host_path) == 0) return STATUS_SUCCESS;
-    if (rmdir(host_path)  == 0) return STATUS_SUCCESS;
+    int removed=unlink(host_path)==0||rmdir(host_path)==0;
+    if(removed){
+#if defined(__ANDROID__)
+        extern void xbox_android_path_created(const char *);xbox_android_path_created(host_path);
+#endif
+        return STATUS_SUCCESS;
+    }
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
@@ -1473,7 +1524,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
              * matches NT "delete on close" semantics exactly. */
             if (info->DeleteFile) {
                 const char* p = w32_handle_path(FileHandle);
-                if (p) unlink(p);
+                if (p && unlink(p)==0) {
+#if defined(__ANDROID__)
+                    extern void xbox_android_path_created(const char *);
+                    xbox_android_path_created(p);
+#endif
+                }
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1626,6 +1682,10 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
         return STATUS_INVALID_PARAMETER;
     if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
+#if defined(__ANDROID__)
+    extern int xbox_android_path_cached_missing(void);
+    if(xbox_android_path_cached_missing())return STATUS_OBJECT_NAME_NOT_FOUND;
+#endif
     if (stat(host_path, &st) != 0)
         return STATUS_OBJECT_NAME_NOT_FOUND;
 

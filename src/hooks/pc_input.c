@@ -155,6 +155,12 @@ static void build_config(InputHostConfig *cfg)
     cfg->keyboard = modes[mode >= 0 && mode < 7 ? mode : 0];
     cfg->players = geti("input", "players", 0);
     cfg->use_sdl = geti("input", "backend", 0) == 0;
+#if defined(__ANDROID__)
+    /* Touch and the first physical pad must control the same player. Android
+     * has no XInput backend; SDL handles USB/Bluetooth Xbox/PlayStation pads. */
+    cfg->keyboard = INPUT_HOST_KEYBOARD_MERGE;
+    cfg->use_sdl = 1;
+#endif
     cfg->rumble_percent = geti("input", "rumble", 100);
     cfg->rumble_floor = geti("input", "rumble_floor", 60);
     cfg->rumble_min_ms = geti("input", "rumble_min_ms", 200);

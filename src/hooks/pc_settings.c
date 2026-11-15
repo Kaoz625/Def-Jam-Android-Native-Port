@@ -32,6 +32,9 @@
 #endif
 #include "pc_settings.h"
 #include "pc_settings_catalog.h"
+#if defined(__ANDROID__)
+#include "pc_language.h"
+#endif
 #include "pc_input.h"
 #include "pc_ui.h"
 #include "pc_debug.h"
@@ -451,6 +454,10 @@ int pc_settings_init(void)
     else
         fprintf(stderr, "[SETTINGS] no data folder found; saves use the runtime's default location\n");
 
+#if defined(__ANDROID__)
+    extern void defjam_sched_settings_ready(void);
+    defjam_sched_settings_ready();
+#endif
     pc_input_start();
     run_launcher_if_wanted();
     {
@@ -486,6 +493,14 @@ int pc_settings_init(void)
         }
     }
 
+#if defined(__ANDROID__)
+    /* Prepare translated copies before the guest opens game files. */
+    pc_language_start(have_root ? root : NULL, "game");
+    fprintf(stderr, "[LANG40] story choice=%d effective=%d (0 auto, 1 all, 2 original)\n",
+            recomp_settings_get("language", "story_subtitles", 1), pc_language_all_subtitles());
+
+#endif
+
     /* The play-test recorder ([debug] record): after the launcher, which can turn it on,
      * and before the audio starts, whose capture it points into the session. */
 #if defined(_WIN32)
@@ -520,6 +535,10 @@ int pc_settings_init(void)
     }
 #endif
     d3d8_present_set_render_scale((unsigned)pc_display("render_scale", 2));
+#if defined(__ANDROID__)
+    extern void d3d8_present_set_render_height151(unsigned height);
+    d3d8_present_set_render_height151((unsigned)pc_display("render_height151",0));
+#endif
     pc_settings_apply_display();
     recomp_settings_on_change(setting_changed, NULL);
     fflush(stderr);

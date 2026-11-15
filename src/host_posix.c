@@ -21,6 +21,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__ANDROID__)
+#include "android_host_events127.h"
+#include "platform/android_thread_policy.h"
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -42,6 +46,12 @@ static volatile unsigned s_refresh_hz;   /* the window's display, 0 if unknown *
 static Uint32      s_call_event;
 static const char *const *s_extensions;
 static Uint32      s_extension_count;
+#if defined(__ANDROID__)
+static const char *const s_android_extensions[] = {
+    "VK_KHR_surface",
+    "VK_KHR_android_surface"
+};
+#endif
 
 /* ── Work for the first thread ─────────────────────────────────────────── */
 
@@ -169,6 +179,12 @@ static void make_window_main(void *arg)
             SDL_DestroySurface(icon);
         }
     }
+#if defined(__ANDROID__)
+    /* Do not ask SDL's system Vulkan loader for these when a custom Turnip
+     * loader may be active. The required Android WSI extensions are fixed. */
+    s_extensions = s_android_extensions;
+    s_extension_count = (Uint32)(sizeof s_android_extensions / sizeof s_android_extensions[0]);
+#else
     s_extensions = SDL_Vulkan_GetInstanceExtensions(&s_extension_count);
     if (!s_extensions) {
         fprintf(stderr, "[HOST] SDL cannot name its Vulkan extensions: %s\n", SDL_GetError());
@@ -176,6 +192,7 @@ static void make_window_main(void *arg)
         s_window = NULL;
         return;
     }
+#endif
     refresh_drawable();
 }
 
@@ -184,8 +201,14 @@ typedef struct { void *instance; void *surface; int ok; } SurfaceRequest;
 static void make_surface_main(void *arg)
 {
     SurfaceRequest *r = arg;
+#if defined(__ANDROID__)
+    void *native_window = SDL_GetPointerProperty(SDL_GetWindowProperties(s_window),
+                                                  SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+    r->ok = d3d8_vk_android_create_surface(r->instance, native_window, r->surface);
+#else
     r->ok = SDL_Vulkan_CreateSurface(s_window, (VkInstance)r->instance, NULL,
                                      (VkSurfaceKHR *)r->surface);
+#endif
     if (!r->ok)
         fprintf(stderr, "[HOST] no Vulkan surface: %s\n", SDL_GetError());
     refresh_drawable();
@@ -293,7 +316,12 @@ static void overlay_changed_main(int open)
         return;
     if (open) {
         SDL_ShowCursor();
+#if defined(__ANDROID__)
+        /* Opening a pad/touch menu is not a request for Android's software IME. */
+        SDL_StopTextInput(s_window);
+#else
         SDL_StartTextInput(s_window);
+#endif
     } else {
         SDL_StopTextInput(s_window);
         if (s_fullscreen)
@@ -310,6 +338,10 @@ int host_posix_open_window(int width, int height, const char *title)
 
     if (!s_have_video)
         return 0;
+#if defined(__ANDROID__)
+    // Finger events are handled directly by the overlay; avoid duplicate mouse clicks.
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+#endif
     call_on_main(make_window_main, &r);
     if (!s_window)
         return 0;
@@ -335,7 +367,13 @@ int host_posix_open_window(int width, int height, const char *title)
 /* ── The first thread ──────────────────────────────────────────────────── */
 
 static int (*s_game_main)(void);
+#if defined(__ANDROID__)
+#include <stdatomic.h>
+static _Atomic int s_game_done;
+static int s_game_result;
+#else
 static volatile int s_game_done, s_game_result;
+#endif
 
 static void *game_thread(void *unused)
 {
@@ -398,6 +436,10 @@ static void handle_event(const SDL_Event *ev)
     /* The overlay's own key, a key being learned for a binding, and (while it is up) the
      * pointer and typing. The window's events are in points; the overlay says what it needs. */
     switch (ev->type) {
+#if defined(__ANDROID__)
+    case SDL_EVENT_FINGER_DOWN: case SDL_EVENT_FINGER_UP: case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_CANCELED:
+#endif
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: case SDL_EVENT_TEXT_INPUT:
     case SDL_EVENT_MOUSE_MOTION: case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
     case SDL_EVENT_MOUSE_WHEEL: case SDL_EVENT_WINDOW_MOUSE_LEAVE: {
@@ -571,6 +613,17 @@ static void script_step(void)
     }
 }
 
+#if defined(__ANDROID__)
+/* Bypass SDL_WaitEventTimeout's Android internal loop: when the lifecycle
+ * backend cannot block, a100ms call can consume100ms CPU before returning.
+ * Poll still pumps lifecycle/main-thread callbacks; the OS condvar sleeps. */
+static bool host_event_watch127(void *userdata,SDL_Event *event){
+    (void)userdata;
+    if(event->type!=SDL_EVENT_POLL_SENTINEL)host_event_wake127();
+    return true;
+}
+#endif
+
 /* Run the game. With a display: on its own thread, this one serving the
  * window until the game returns. Without: here. */
 int host_posix_run(int (*game_main)(void))
@@ -585,6 +638,11 @@ int host_posix_run(int (*game_main)(void))
      * loader resolves for this executable's architecture. */
     if (!getenv("SDL_VULKAN_LIBRARY"))
         SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, DEFJAM_VULKAN_LIBRARY);
+#endif
+#if defined(__ANDROID__)
+    /* SDL reads this only during video initialisation. Java also locks the
+     * Activity, but this prevents SDL's sensor listener from restoring portrait. */
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #endif
     if (getenv("RECOMP_HEADLESS") || !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         if (!getenv("RECOMP_HEADLESS"))
@@ -610,12 +668,37 @@ int host_posix_run(int (*game_main)(void))
     pthread_attr_destroy(&attr);
     if (getenv("RECOMP_HOST_SCRIPT"))
         script_parse(getenv("RECOMP_HOST_SCRIPT"));
+#if defined(__ANDROID__)
+    defjam_android_native_thread_enter("host-events","host_posix_run",(uintptr_t)host_posix_run);
+    host_event_sequence127();
+    bool watch127=SDL_AddEventWatch(host_event_watch127,NULL);
+    uint64_t epoch127=SDL_GetTicksNS(),cpu127=0,events127=0,polls127=0;
+    struct timespec t127;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t127);
+    cpu127=(uint64_t)t127.tv_sec*1000000000ull+t127.tv_nsec;
+#endif
     while (!s_game_done) {
         SDL_Event ev;
-        if (SDL_WaitEventTimeout(&ev, s_script_n ? 10 : 100))
-            handle_event(&ev);
+#if defined(__ANDROID__)
+        uint64_t seen127=host_event_sequence127();unsigned batch127=0;
+        while(batch127<64&&SDL_PollEvent(&ev)){handle_event(&ev);batch127++;}
+        events127+=batch127;polls127++;
         script_step();
+        if(!s_game_done)host_event_pause127(seen127,batch127==64);
+        uint64_t now127=SDL_GetTicksNS();
+        if(now127-epoch127>=10000000000ull){
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t127);uint64_t cpu_now127=(uint64_t)t127.tv_sec*1000000000ull+t127.tv_nsec;
+            fprintf(stderr,"[HOST127] events=%llu polls=%llu wall_ms=%.1f thread_cpu_ms=%.1f cpu_pct=%.2f; OS event wait, lifecycle/input retained\n",
+                (unsigned long long)events127,(unsigned long long)polls127,(now127-epoch127)/1e6,(cpu_now127-cpu127)/1e6,100.0*(cpu_now127-cpu127)/(now127-epoch127));
+            epoch127=now127;cpu127=cpu_now127;events127=polls127=0;
+        }
+#else
+        if(SDL_WaitEventTimeout(&ev,s_script_n?10:100))handle_event(&ev);
+        script_step();
+#endif
     }
+#if defined(__ANDROID__)
+    if(watch127)SDL_RemoveEventWatch(host_event_watch127,NULL);
+#endif
     pthread_join(th, NULL);
     SDL_Quit();
     return s_game_result;

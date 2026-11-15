@@ -470,10 +470,10 @@ static void recorder_picture_now(IDirect3DDevice8 *dev, uint64_t tag, const uint
 {
     IDirect3DSurface8 *surf = NULL;
     D3DLOCKED_RECT lr;
-    extern unsigned d3d8_GetRenderScale(void);
+    extern float d3d8_GetCanvasScaleY(void);
     extern float d3d8_GetCanvasScaleX(void);
     uint32_t sw = (uint32_t)(TRANSLATOR_WIDTH * d3d8_GetCanvasScaleX() + 0.5f);
-    uint32_t sh = TRANSLATOR_HEIGHT * d3d8_GetRenderScale();
+    uint32_t sh = (uint32_t)(TRANSLATOR_HEIGHT * d3d8_GetCanvasScaleY() + 0.5f);
 
     if (FAILED(dev->lpVtbl->GetBackBuffer(dev, 0, 0, &surf)) || !surf)
         return;
@@ -667,7 +667,13 @@ void d3d11_translator_frame_end(void)
         {
             extern int d3d8_present_display_paced(void);
             extern void xbox_Nv2aSetFlipHz(int hz);
+            #if defined(__ANDROID__)
+            extern int android_native120_flip_hz140(void);
+            int native140=android_native120_flip_hz140();
+            xbox_Nv2aSetFlipHz(native140?native140:(d3d8_present_display_paced()?63:0));
+#else
             xbox_Nv2aSetFlipHz(d3d8_present_display_paced() ? 63 : 0);
+#endif
         }
 #if defined(_WIN32)
         log_display_pacing();
@@ -696,13 +702,12 @@ static void capture_backbuffer(IDirect3DDevice8 *dev)
     uint32_t row = ((w * 3) + 3) & ~3u;
     uint8_t hdr[54];
     uint32_t y, x, size;
-    extern unsigned d3d8_GetRenderScale(void);
+    extern float d3d8_GetCanvasScaleY(void);
     extern float d3d8_GetCanvasScaleX(void);
-    uint32_t sc = d3d8_GetRenderScale();
     /* The target's size: the title's times the render scale, wider across when
      * it is a widescreen canvas (docs/widescreen/02-design.md). */
     uint32_t sw = (uint32_t)(TRANSLATOR_WIDTH * d3d8_GetCanvasScaleX() + 0.5f);
-    uint32_t sh = TRANSLATOR_HEIGHT * sc;
+    uint32_t sh = (uint32_t)(TRANSLATOR_HEIGHT * d3d8_GetCanvasScaleY() + 0.5f);
     const char *native_shot = getenv("RECOMP_TRANS_SHOT_NATIVE");
     const char *wide_shot = getenv("RECOMP_TRANS_SHOT_WIDE");
     /* HD review needs actual rendered pixels; regression captures stay 640x480
@@ -711,7 +716,7 @@ static void capture_backbuffer(IDirect3DDevice8 *dev)
     if (native_shot && !strcmp(native_shot,"1")) {
         w = sw; h = sh;
     } else if (wide_shot && !strcmp(wide_shot, "1")) {
-        w = (sw + sc / 2) / sc;
+        w = sh ? (sw * TRANSLATOR_HEIGHT + sh / 2) / sh : TRANSLATOR_WIDTH;
     }
     row = ((w * 3) + 3) & ~3u;
 
@@ -904,10 +909,16 @@ void d3d11_translator_pump(void)
 void d3d11_translator_report(void)
 {
     static PgraphD3D11Stats prev;
+    static DWORD last_report;
     PgraphD3D11Stats st;
+    DWORD now;
 
     if (!s_ready)
         return;
+    now = GetTickCount();
+    if (last_report && now - last_report < 2000)
+        return;
+    last_report = now;
     pgraph_d3d11_get_stats(&st);
     if (memcmp(&st, &prev, sizeof(st)) == 0)
         return;

@@ -4,6 +4,12 @@
 #include "pc_language.h"
 
 static const char *const k_subtitles[] = { "auto", "all cutscenes", "as the game does", NULL };
+/* [android] contatg's Android 1.4 defaults Story subtitles to "all cutscenes". */
+#if defined(__ANDROID__)
+#define STORY_SUBTITLES_DEFAULT 1
+#else
+#define STORY_SUBTITLES_DEFAULT 0
+#endif
 static const char *const k_game[] = { "english", "french", NULL };
 
 size_t pc_language_settings(RecompSetting *out, size_t max)
@@ -15,7 +21,7 @@ size_t pc_language_settings(RecompSetting *out, size_t max)
     ADD("language", "pack", RECOMP_SETTING_STRING, 0, 0, 0, NULL, "RECOMP_LANGUAGE_PACK", RECOMP_SETTING_RESTART,
         "Language mod: a folder in the mods folder with language.ini (the Mods page sets it); empty plays the "
         "game in its own English.");
-    ADD("language", "story_subtitles", RECOMP_SETTING_ENUM, 0, 0, 0, k_subtitles, "RECOMP_STORY_SUBTITLES",
+    ADD("language", "story_subtitles", RECOMP_SETTING_ENUM, STORY_SUBTITLES_DEFAULT, 0, 0, k_subtitles, "RECOMP_STORY_SUBTITLES",
         RECOMP_SETTING_RESTART,
         "Subtitles in Story cutscenes: auto follows the language pack (a translation shows them in every "
         "cutscene), or choose.");

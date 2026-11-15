@@ -33,8 +33,10 @@ static int match_prefix(const char* path, const char* prefix)
 {
     int i = 0;
     while (prefix[i]) {
-        if (tolower((unsigned char)path[i]) != tolower((unsigned char)prefix[i]))
-            return 0;
+        unsigned char a=(unsigned char)path[i],b=(unsigned char)prefix[i];
+        if(a=='/')a=92;
+        if(b=='/')b=92;
+        if (tolower(a) != tolower(b)) return 0;
         i++;
     }
     return i;
@@ -796,6 +798,113 @@ static void match_case_below(char* path, size_t root_len)
     }
 }
 
+
+#if defined(__ANDROID__)
+#include <pthread.h>
+#include <stdatomic.h>
+#define READONLY_PATH_SLOTS123 2048
+/* No eviction: a true miss is remembered for this process lifetime. A disc
+ * replacement/import requires restarting the game. Writable roots are excluded. */
+typedef struct { char key[MAX_PATH],resolved[MAX_PATH]; unsigned hash; int state,error,reported_missing; } ReadonlyPath123;
+static ReadonlyPath123 s_readonly123[READONLY_PATH_SLOTS123];
+static pthread_mutex_t s_readonly_guard123=PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local int s_path_missing123,s_path_disc123;
+static _Atomic unsigned s_path_hit123,s_path_miss123,s_path_case123;
+static int s_path_enabled123=-1,s_path_full123;
+static unsigned path_key123(const char *path,char key[MAX_PATH]){
+    unsigned h=2166136261u;size_t n=0;
+    /* Do not memoize parent traversal: preserve the original filesystem rules. */
+    const char *c=path;while(*c){const char *end=strchr(c,'/');size_t len=end?(size_t)(end-c):strlen(c);
+        if(len==2&&c[0]=='.'&&c[1]=='.')return 0;if(!end)break;c=end+1;}
+    for(size_t i=0;path[i];i++){
+        unsigned char b=(unsigned char)path[i];if(b=='/'&&n&&key[n-1]=='/')continue;
+        if(n+1>=MAX_PATH)return 0;b=(unsigned char)tolower(b);key[n++]=(char)b;h=(h^b)*16777619u;
+    }
+    key[n]=0;return h?h:1;
+}
+static int readonly_root123(const char *path){size_t n=strlen(s_game_dir);return n&&strncmp(path,s_game_dir,n)==0&&(path[n]=='/'||!path[n]);}
+static void readonly_resolve123(char *path,size_t root_len){
+    char key[MAX_PATH],original[MAX_PATH];unsigned hash=path_key123(path,key);struct stat st;
+    if(!hash){match_case_below(path,root_len);return;}
+    pthread_mutex_lock(&s_readonly_guard123);
+    if(s_path_enabled123<0){const char *v=getenv("DEFJAM_PATH_CACHE");s_path_enabled123=!(v&&*v=='0');}
+    ReadonlyPath123 *entry=NULL;
+    for(unsigned n=0;n<READONLY_PATH_SLOTS123;n++){
+        ReadonlyPath123 *e=&s_readonly123[(hash+n)%READONLY_PATH_SLOTS123];
+        if(!e->state){entry=e;break;}
+        if(e->hash==hash&&!strcmp(e->key,key)){
+            if(s_path_enabled123&&e->state!=3){strcpy(path,e->resolved);s_path_missing123=e->error;atomic_fetch_add_explicit(&s_path_hit123,1,memory_order_relaxed);pthread_mutex_unlock(&s_readonly_guard123);return;}
+            entry=e;break; /* Cache-off A/B still deduplicates missing messages. */
+        }
+    }
+    strcpy(original,path);match_case_below(path,root_len);
+    int result=stat(path,&st),error=result?errno:0;
+    if(error!=ENOENT&&error!=ENOTDIR)error=0;
+    int first=entry&&!entry->state;
+    if(entry){strcpy(entry->key,key);strcpy(entry->resolved,path);entry->hash=hash;entry->state=error?2:1;entry->error=error;}
+    else if(!s_path_full123++){fprintf(stderr,"[PATH123] read-only table full; uncached paths retain real filesystem checks\n");}
+    if(first&&strcmp(original,path)){atomic_fetch_add_explicit(&s_path_case123,1,memory_order_relaxed);fprintf(stderr,"[CASE123] %s -> %s\n",original+root_len,path+root_len);}
+    if(error){
+        s_path_missing123=s_path_enabled123?error:0;
+        if(entry&&!entry->reported_missing){entry->reported_missing=1;atomic_fetch_add_explicit(&s_path_miss123,1,memory_order_relaxed);fprintf(stderr,"[MISSING123] game%s errno=%d; absent after component-wise case lookup; check original disc inventory\n",path+root_len,error);}
+    }
+    pthread_mutex_unlock(&s_readonly_guard123);
+}
+void xbox_android_path_open_failed(const char *path,int error){
+    if(error!=ENOENT&&error!=ENOTDIR)return;
+    char key[MAX_PATH];unsigned hash=path_key123(path,key);if(!hash)return;
+    pthread_mutex_lock(&s_readonly_guard123);
+    for(unsigned n=0;n<READONLY_PATH_SLOTS123;n++){
+        ReadonlyPath123 *e=&s_readonly123[(hash+n)%READONLY_PATH_SLOTS123];if(!e->state)break;
+        if(e->hash==hash&&!strcmp(e->key,key)){
+            e->state=2;e->error=error;
+            if(!e->reported_missing){e->reported_missing=1;atomic_fetch_add_explicit(&s_path_miss123,1,memory_order_relaxed);fprintf(stderr,"[MISSING123] game%s errno=%d; host open failed after resolution; check original disc inventory\n",path+strlen(s_game_dir),error);}
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_readonly_guard123);
+}
+int xbox_android_path_cached_missing(void){return s_path_missing123;}
+int xbox_android_path_is_disc(void){return s_path_disc123;}
+int xbox_android_redirect_language_readonly(char *path, DWORD capacity)
+{
+    size_t n = strlen(s_game_dir);
+    char replacement[MAX_PATH];
+    if (!s_path_disc123 || !g_xbox_game_file_redirect || !n ||
+        strncmp(path, s_game_dir, n) || path[n] != '/') return 0;
+    if (!g_xbox_game_file_redirect(path + n + 1, replacement, sizeof replacement)) return 0;
+    size_t count = strlen(replacement) + 1;
+    if (count > capacity) return 0;
+    memcpy(path, replacement, count);
+    s_path_disc123 = 0; /* a cache file, not a failed opening of the original disc */
+    return 1;
+}
+
+void xbox_android_path_created(const char *path){
+    if(!readonly_root123(path))return;
+    pthread_mutex_lock(&s_readonly_guard123);
+    /* Invalidate related results, not the cache for the rest of the session.
+     * state3 is occupied-but-stale: preserve open-addressing probe chains and
+     * log-once flags, then re-resolve lazily. A parent creation/removal can
+     * affect children; a new child can invalidate a cached ancestor miss. */
+    char key[MAX_PATH];unsigned hash=path_key123(path,key),invalidated=0;
+    if(hash){size_t n=strlen(key);while(n>1&&key[n-1]=='/')key[--n]=0;}
+    for(unsigned i=0;i<READONLY_PATH_SLOTS123;i++){
+        ReadonlyPath123 *e=&s_readonly123[i];if(!e->state)continue;
+        size_t a=hash?strlen(key):0,b=strlen(e->key),n=a<b?a:b;
+        if(!hash||(!strncmp(key,e->key,n)&&(a==b||(a<b?e->key[n]:key[n])=='/'))){
+            e->state=3;e->error=0;invalidated++;
+        }
+    }
+    static unsigned reports128;
+    if(reports128++<8)fprintf(stderr,"[PATH128] related_invalidated=%u cache_enabled=%d; unrelated entries retained, stale results revalidated on access\n",invalidated,s_path_enabled123);
+    pthread_mutex_unlock(&s_readonly_guard123);
+}
+void xbox_android_path_stats(unsigned *hits,unsigned *misses,unsigned *cases){
+    *hits=atomic_exchange(&s_path_hit123,0);*misses=atomic_exchange(&s_path_miss123,0);*cases=atomic_exchange(&s_path_case123,0);
+}
+#endif
+
 /* Recursively create a directory and all missing parents. */
 static void mkdir_p(const char* path)
 {
@@ -987,6 +1096,9 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
+#if defined(__ANDROID__)
+    s_path_missing123=0;s_path_disc123=0;
+#endif
     const char* remainder = NULL;
     const char* base_dir  = NULL;
     const char* sub_dir   = NULL;
@@ -1036,9 +1148,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     /* The same line and the same notification as the Windows translator: the
      * unattended-run tooling reads one and times its input by the other. */
+#if !defined(__ANDROID__)
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
-    xbox_AnchorNoteOpen(xbox_path);
     fflush(stderr);
+#endif
+    xbox_AnchorNoteOpen(xbox_path);
     if (g_xbox_game_file_redirect && base_dir == s_game_dir && !sub_dir && remainder[0] &&
         g_xbox_game_file_redirect(remainder, host_path_buf, buf_size)) {
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s (redirected)", xbox_path, host_path_buf);
@@ -1069,6 +1183,11 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+#if defined(__ANDROID__)
+        s_path_disc123=base_dir==s_game_dir&&!sub_dir;
+        if(s_path_disc123)readonly_resolve123(host_path_buf,strlen(base_dir));
+        else
+#endif
         match_case_below(host_path_buf,
                          strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
 

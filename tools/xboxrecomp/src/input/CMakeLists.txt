@@ -39,7 +39,9 @@ elseif(XBOXRECOMP_SDL3)
     # sound use it as well, and a process cannot hold SDL2 and SDL3 at once
     # (they export the same names). Pads go through the host input layer, and
     # the program's window feeds keyboard.c's table itself.
-    find_package(SDL3 REQUIRED CONFIG)
+    if(NOT TARGET SDL3::SDL3)
+        find_package(SDL3 REQUIRED CONFIG)
+    endif()
     target_sources(xbox_input PRIVATE input_host.c)
     target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
     target_compile_definitions(xbox_input PUBLIC XBOXRECOMP_HAVE_SDL3=1)

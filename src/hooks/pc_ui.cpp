@@ -77,6 +77,10 @@ extern "C" {
 #include "pc_ui_internal.h"
 #include "song_convert.h"
 #include "song_library.h"
+#if defined(__ANDROID__)
+#include "online_screen.h"
+#include "graphics_menu145.h"
+#endif
 
 #ifndef DEFJAM_VERSION
 #define DEFJAM_VERSION "dev"
@@ -2413,6 +2417,9 @@ extern "C" void host_posix_overlay_changed(int open);      // src/host_posix.c
 namespace {
 
 std::atomic<bool> g_open(false);
+#if defined(__ANDROID__)
+std::atomic<bool> g_online_open(false);
+#endif
 std::atomic<bool> g_toggle(false);
 bool g_just_opened = false;
 bool g_ready = false;               // the context and backends exist (under the lock)
@@ -2532,10 +2539,19 @@ void set_open(bool open)
 {
     if (g_open.load() == open) return;
     g_open = open;
+#if defined(__ANDROID__)
+    // Closing by touch can precede the Android UP event; never reopen with a stuck press.
+    if (!open && g_ready) ImGui::GetIO().AddMouseButtonEvent(0, false);
+#endif
     g_just_opened = open;
-    xbox_HostInputSetUiActive(open ? 1 : 0);
+    int active145=open?1:0;
+#if defined(__ANDROID__)
+    if(open)graphics145::open();else graphics148_closed();
+    active145|=g_online_open.load()?1:0;
+#endif
+    xbox_HostInputSetUiActive(active145);
 #if !defined(_WIN32)
-    host_posix_overlay_changed(open ? 1 : 0);       // the pointer shows, and typing is delivered
+    host_posix_overlay_changed(active145);       // the pointer shows, and typing is delivered
 #endif
     fprintf(stderr, "[UI] overlay %s\n", open ? "opened" : "closed");
     fflush(stderr);
@@ -2548,7 +2564,23 @@ void set_open(bool open)
 extern "C" void pc_ui_set_window(HWND window) { g_window = window; }
 #endif
 
-extern "C" int pc_ui_overlay_open(void) { return g_open.load() ? 1 : 0; }
+extern "C" int pc_ui_overlay_open(void) {
+#if defined(__ANDROID__)
+    if(g_online_open.load())return 1;
+#endif
+    return g_open.load()?1:0;
+}
+
+#if defined(__ANDROID__)
+// Distinguish online navigation from the direct-touch port settings overlay.
+extern "C" int pc_ui_online_open(void) { return g_online_open.load() && !g_open.load() ? 1 : 0; }
+extern "C" int pc_ui_online_button(int button, int down) {
+    ui_lock();
+    int handled = g_online_open.load() && !g_open.load() && online_screen::touch_button(button, down != 0);
+    ui_unlock();
+    return handled;
+}
+#endif
 
 extern "C" void pc_ui_apply_settings(void)
 {
@@ -2738,6 +2770,19 @@ bool ui_sdl_event(const SDL_Event *e, float scale_x, float scale_y)
 {
     ImGuiIO &io = ImGui::GetIO();
     switch (e->type) {
+#if defined(__ANDROID__)
+    case SDL_EVENT_FINGER_DOWN:
+    case SDL_EVENT_FINGER_UP:
+    case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_CANCELED:
+        io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
+        io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+        io.AddMousePosEvent(e->tfinger.x * io.DisplaySize.x, e->tfinger.y * io.DisplaySize.y);
+        if (e->type == SDL_EVENT_FINGER_DOWN) io.AddMouseButtonEvent(0, true);
+        else if (e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED)
+            io.AddMouseButtonEvent(0, false);
+        return true;
+#endif
     case SDL_EVENT_MOUSE_MOTION:
         io.AddMousePosEvent(e->motion.x * scale_x, e->motion.y * scale_y);
         return true;
@@ -2809,8 +2854,35 @@ int overlay_active(void *)
     pad_mark_poll();
     if (!ui_capturing() && !g_open.load()) song_pad_poll();
     if (!ui_capturing() && !g_chords.empty() && pad_toggle_pressed()) toggled = true;
+#if defined(__ANDROID__)
+    if(int request147=graphics145_take_request()){
+        online_screen::clear_touch_buttons();
+        if(request147==1)graphics148_editor();
+        else if(!g_open.load()){
+            set_open(true);graphics145::open_game147();
+        }
+        toggled=false;
+    }
+    if(online_screen::take_close_request()&&g_online_open.load()){
+        online_screen::clear_touch_buttons();
+        g_online_open=false;xbox_HostInputSetUiActive(g_open.load()?1:0);host_posix_overlay_changed(g_open.load()?1:0);
+    }
+    if(toggled&&g_online_open.load()&&!g_open.load()){
+        online_screen::clear_touch_buttons();
+        g_online_open=false;xbox_HostInputSetUiActive(0);host_posix_overlay_changed(0);
+        if(g_ready)ImGui::GetIO().AddMouseButtonEvent(0,false);toggled=false;
+    }
+    if(toggled&&!g_open.load()){graphics148_editor();toggled=false;}
+    if(!g_open.load()&&online_screen::take_open_request()){
+        g_online_open=true;xbox_HostInputSetUiActive(1);host_posix_overlay_changed(1);
+        fprintf(stderr,"[ONLINE-NATIVE] PC screen flow opened inside Vulkan overlay\n");
+    }
+#endif
     if (toggled) set_open(!g_open.load());
-    bool open = g_open.load();
+    bool open=g_open.load();
+#if defined(__ANDROID__)
+    open=open||g_online_open.load();
+#endif
     ui_unlock();
     return open ? 1 : 0;
 }
@@ -2824,7 +2896,11 @@ void overlay_init_backend(const D3D8VkOverlayFrame *f)
     info.Device = (VkDevice)f->device;
     info.QueueFamily = f->queue_family;
     info.Queue = (VkQueue)f->queue;
+#if defined(__ANDROID__)
+    info.DescriptorPoolSize=512; // native online portraits, venues and font atlas
+#else
     info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE;
+#endif
     info.MinImageCount = 2;
     info.ImageCount = f->image_count < 2 ? 2 : f->image_count;
     info.PipelineInfoMain.RenderPass = (VkRenderPass)f->render_pass;
@@ -2835,9 +2911,12 @@ void overlay_init_backend(const D3D8VkOverlayFrame *f)
 void overlay_draw(const D3D8VkOverlayFrame *f, void *)
 {
     ui_lock();
-    if (!g_open.load()) { ui_unlock(); return; }
+    if (!pc_ui_overlay_open()) { ui_unlock(); return; }
     if (g_ready && f->generation != g_vk_generation) {
         // The window's image has another format: the pipelines were built for the old pass.
+#if defined(__ANDROID__)
+        online_screen::release_textures();
+#endif
         ImGui_ImplVulkan_Shutdown();
         overlay_init_backend(f);
     }
@@ -2860,7 +2939,27 @@ void overlay_draw(const D3D8VkOverlayFrame *f, void *)
     ui_feed_gamepad();
     ImGui_ImplVulkan_NewFrame();
     ui_sdl_frame((float)f->width, (float)f->height, 1.0f);
+#if defined(__ANDROID__)
+    online_screen::prepare(nullptr); // graphics uses the same extracted title fonts
+#endif
     ImGui::NewFrame();
+#if defined(__ANDROID__)
+    if(g_open.load()){
+        bool keep=graphics145::draw(ImGui::GetIO().DisplaySize);
+        ImGui::Render();online_screen::update_textures();
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),(VkCommandBuffer)f->command_buffer);
+        if(!keep)set_open(false);
+        ui_unlock();return;
+    }
+    if(g_online_open.load()){
+        bool keep=online_screen::draw(ImGui::GetIO().DisplaySize);
+        ImGui::Render();online_screen::update_textures();
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),(VkCommandBuffer)f->command_buffer);
+        if(!keep){online_screen::clear_touch_buttons();g_online_open=false;xbox_HostInputSetUiActive(0);host_posix_overlay_changed(0);
+            ImGui::GetIO().AddMouseButtonEvent(0,false);}
+        ui_unlock();return;
+    }
+#endif
 
     // Dim the game and put the settings in a panel in the middle (as the Direct3D overlay does).
     ImGuiIO &io = ImGui::GetIO();
@@ -2930,7 +3029,7 @@ extern "C" int pc_ui_sdl_event(const void *event, float window_width, float wind
             return 1;
         }
     }
-    if (!g_open.load()) return 0;
+    if (!pc_ui_overlay_open()) return 0;
     ui_lock();
     int handled = 0;
     if (g_ready) {
@@ -2942,7 +3041,7 @@ extern "C" int pc_ui_sdl_event(const void *event, float window_width, float wind
             float fw = (float)g_frame_w.load(), fh = (float)g_frame_h.load();
             float sx = window_width > 0 && fw > 0 ? fw / window_width : 1.0f;
             float sy = window_height > 0 && fh > 0 ? fh / window_height : 1.0f;
-            ui_sdl_event(e, sx, sy);
+            handled = ui_sdl_event(e, sx, sy) ? 1 : 0;
         }
     }
     ui_unlock();

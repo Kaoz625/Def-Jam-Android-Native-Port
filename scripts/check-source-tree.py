@@ -54,6 +54,28 @@ APPROVED_README_MEDIA = {
     'docs/media/app-first-run.png': '72a941c2f8f36650da1ae192754f1c6d425fae87ddffbcf799b6b93fc1f9fb44',
     'docs/media/app-mods-browse.png': '62ce3debd8fa090920cb5b55a6906b7b6268dff4acc71483190513f3ca796ab0',
 }
+# 2026-10-22: the user requested uploading the complete Android source,
+# including their existing custom controls. Exact fingerprints only; no
+# general exception for game assets. The window icon is the unchanged D98 icon.
+APPROVED_ANDROID_ART = {
+    # User-provided launcher artwork explicitly requested for v20.
+    'android/app/src/main/res/drawable-nodpi/ic_launcher_v1.jpg': 'dc6de99e9c5ddb1f6889850282cdd731a84cb098b0b2f682bbbd3af43f0f4fa1',
+    'android/app/src/main/res/drawable-nodpi/ic_launcher_art.jpg': '9829b96b8361af80b12c2da4d0a466627a580e71413e20a0e6c3fa5fdf94ab6e',
+    'android/app/src/main/res/drawable-nodpi/ctl_agarrar.png': '3d446b6220ce0896174e1b5bb70210c846162a054ca2a79ffc50c166056a485e',
+    'android/app/src/main/res/drawable-nodpi/ctl_chute.png': '77d208464e38598b422bd4e97703241553e3250e5c6d88f663ca9b4a4cd207e1',
+    'android/app/src/main/res/drawable-nodpi/ctl_config.png': '626cc10020157f1e7461229555be120595f351dd39fa90c6ca4aafe21146779c',
+    'android/app/src/main/res/drawable-nodpi/ctl_correr.png': '1eb560a0bfe9d2f55bb4cb0669a1be787f9e8ee4fa3978c28684d7750bbf1095',
+    'android/app/src/main/res/drawable-nodpi/ctl_defender.png': '9c4b3b14715143e46bb2a7594ac4088829c3ac68c3b5cb23a5d34e32168c7ee2',
+    'android/app/src/main/res/drawable-nodpi/ctl_down.png': '2115ed9cae0fb41fafc4be2490bebcdc41eb742c24c8ef0d032a82a9d839f5ed',
+    'android/app/src/main/res/drawable-nodpi/ctl_especial.png': 'c79cd91b99fc534ff311509fb09767d1eaec84b0a661ab1a672d800da34b63f3',
+    'android/app/src/main/res/drawable-nodpi/ctl_left.png': '18fc6838b75f79d368f4ad1b69c3096ca46066364f9b0e06e0ab43b059c5a7c9',
+    'android/app/src/main/res/drawable-nodpi/ctl_pause.png': 'ef97ff6e59324195870c371f564c822e5554bdf55d42bee3adbaf6495c61225c',
+    'android/app/src/main/res/drawable-nodpi/ctl_right.png': 'd990be45e72b70cf80c0b7c054676c85460a8cbd97cc7b460f78ff35c436e9cf',
+    'android/app/src/main/res/drawable-nodpi/ctl_soco.png': '8ee9b8ad4f623910558c0c09fd2614c5cbb496c93f7873df5591903e70953c75',
+    'android/app/src/main/res/drawable-nodpi/ctl_up.png': '3cd1a1290fcca8dbe123e0b661304fa0ffd8988f1a467fc492a2021b9ddc7ce0',
+    'branding/icon/window/window-128.rgba': '9694d57536af0f8845831924ce3ca773a0f68ef7c6dab9389b596eebcdee0d9a',
+}
+
 # D98 (2026-10-10): the owner approved committing the application icons and the Steam artwork
 # rendered from the game's own textures (the shield, the title wordmark, the title-screen scene).
 # The whole set is pinned by the SHA-256 of branding/SHA256SUMS, which lists every other file in
@@ -80,7 +102,7 @@ def approved_branding(repo):
 
 
 def path_problem(name, approved=None):
-    if name in APPROVED_README_MEDIA or name in (approved or {}):
+    if name in APPROVED_README_MEDIA or name in APPROVED_ANDROID_ART or name in (approved or {}):
         return None
     path = PurePosixPath(name)
     if name.startswith('config/menu-ui-') or name.endswith(('.local.json', '.local.md')):
@@ -95,7 +117,7 @@ def path_problem(name, approved=None):
 
 
 def text_problem(data, name, approved=None):
-    expected = APPROVED_README_MEDIA.get(name) or (approved or {}).get(name)
+    expected = APPROVED_README_MEDIA.get(name) or APPROVED_ANDROID_ART.get(name) or (approved or {}).get(name)
     if expected:
         if hashlib.sha256(data).hexdigest() != expected:
             return 'approved media changed; requires owner review and fingerprint update'

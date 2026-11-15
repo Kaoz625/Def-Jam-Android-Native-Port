@@ -11,10 +11,19 @@
 #if !defined(_WIN32)
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
+
 #define _GNU_SOURCE
 /* Darwin: exposes memset_s, its explicit_bzero equivalent. */
 #define __STDC_WANT_LIB_EXT1__ 1
 
+#if defined(__ANDROID__)
+#include "platform/xbox_rollback_hooks.h"
+#else
+#define xbox_notify_guest_write(host,length) ((void)0)
+typedef int xbox_guest_write_scope131;
+#define xbox_guest_write_begin131(host,length) 0
+#define xbox_guest_write_end131(scope) ((void)0)
+#endif
 #include "win32_compat.h"
 #include "mmio_trap.h"
 
@@ -31,6 +40,9 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -1028,6 +1040,7 @@ typedef struct w32_object {
     /* mutex */
     DWORD           mtx_owner;
     int             mtx_recursion;
+    unsigned        mtx_waiters; /* protected by lock; only condition waiters */
 
     /* thread */
     pthread_t       thread;
@@ -1244,9 +1257,9 @@ static int waitable_due(w32_object *o)
  */
 static DWORD wait_single(w32_object *o, DWORD ms)
 {
-    struct timespec ts;
+    struct timespec ts = {0,0};
     int timed = (ms != INFINITE);
-    if (timed) deadline_from_ms(ms, &ts);
+    if (timed && ms != 0) deadline_from_ms(ms, &ts); /* Zero-time polling never waits on a deadline. */
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
@@ -1278,8 +1291,10 @@ static DWORD wait_single(w32_object *o, DWORD ms)
             until = o->waitable_due_time;
             bounded = 1;
         }
+        if(o->kind==K_MUTEX)++o->mtx_waiters;
         int rc = bounded ? pthread_cond_timedwait(&o->cond, &o->lock, &until)
                          : pthread_cond_wait(&o->cond, &o->lock);
+        if(o->kind==K_MUTEX)--o->mtx_waiters;
         if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
             result = WAIT_TIMEOUT; break;
         }
@@ -1329,9 +1344,9 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, D
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable)
 {
-    struct timespec ts;
+    struct timespec ts = {0,0};
     int timed = (ms != INFINITE);
-    if (timed) deadline_from_ms(ms, &ts);
+    if (timed && ms != 0) deadline_from_ms(ms, &ts); /* Zero-time polling never waits on a deadline. */
 
     for (;;) {
         if (alertable && drain_apcs() > 0)
@@ -1478,7 +1493,7 @@ BOOL ReleaseMutex(HANDLE h)
     if (--o->mtx_recursion <= 0) {
         o->mtx_owner = 0;
         o->mtx_recursion = 0;
-        pthread_cond_broadcast(&o->cond);
+        if(o->mtx_waiters)pthread_cond_broadcast(&o->cond);
     }
     pthread_mutex_unlock(&o->lock);
     return TRUE;
@@ -1654,7 +1669,13 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return FALSE;
+#if defined(__ANDROID__)
+    /* Bionic deliberately does not implement pthread cancellation.  Keep
+     * the Win32 handle state coherent; Android thread shutdown must be
+     * cooperative at the emulated-kernel layer. */
+#else
     pthread_cancel(o->thread);
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -2455,6 +2476,11 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    /* A volatile byte loop has the same do-not-elide property and works on
+     * every Android API level supported by this runtime. */
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (cnt--) *p++ = 0;
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -2517,12 +2543,23 @@ HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
     return CreateFileA(buf, access, share, sa, disp, flags, templ);
 }
 
+#if defined(__ANDROID__)
+static void rollback_read_cleanup131(void *opaque){xbox_guest_write_end131(*(xbox_guest_write_scope131 *)opaque);}
+#endif
 BOOL ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped)
 {
     (void)overlapped;
     int fd = w32_handle_fd(h);
     if (fd < 0) { if (nread) *nread = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    ssize_t n = read(fd, buf, len);
+    ssize_t n;
+#if defined(__ANDROID__)
+    xbox_guest_write_scope131 scope131=xbox_guest_write_begin131(buf, len);
+    pthread_cleanup_push(rollback_read_cleanup131,&scope131);
+    n=read(fd, buf, len);
+    pthread_cleanup_pop(1);
+#else
+    n=read(fd, buf, len);
+#endif
     if (n < 0)  { if (nread) *nread = 0; SetLastError(ERROR_GEN_FAILURE);    return FALSE; }
     if (nread)  *nread = (DWORD)n;
     return TRUE;
@@ -2766,6 +2803,10 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(__ANDROID__)
+    /* bionic exposes memfd_create only from API 30. The syscall exists on the
+     * arm64 kernels used by API 29 devices, so keep minSdk 29 linkable. */
+    return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0);
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif

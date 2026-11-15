@@ -110,7 +110,7 @@ static bool spawn_detached(const std::string &program, std::vector<std::string> 
 #if defined(__APPLE__)
     // The installed app's play.lock fd survives exec; it must not reach setup.
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
-#elif defined(__GLIBC__) && __GLIBC_PREREQ(2, 34)
+#elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34))
     posix_spawn_file_actions_addclosefrom_np(&files, 3);
 #else
     long limit = sysconf(_SC_OPEN_MAX);

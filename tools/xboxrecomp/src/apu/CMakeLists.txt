@@ -47,7 +47,9 @@ else()
     # XBOXRECOMP_SDL3 the same contract on SDL3 (apu_sdl3.c), for a port
     # whose window and input are SDL3 -- one process cannot hold both.
     if(XBOXRECOMP_SDL3)
-        find_package(SDL3 REQUIRED CONFIG)
+        if(NOT TARGET SDL3::SDL3)
+            find_package(SDL3 REQUIRED CONFIG)
+        endif()
         target_sources(xbox_apu PRIVATE apu_sdl3.c)
         target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
         target_compile_definitions(xbox_apu PRIVATE XBOXRECOMP_HAVE_SDL3=1)

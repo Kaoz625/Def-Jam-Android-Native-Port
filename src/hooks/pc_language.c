@@ -46,6 +46,17 @@
 #include "recomp_settings.h"
 #include "pc_language.h"
 
+#if defined(_WIN32) && !defined(strncasecmp)
+#define strncasecmp _strnicmp
+#endif
+
+/* [android] contatg's Android 1.4 shows Story subtitles in every cutscene by default. */
+#if defined(__ANDROID__)
+#define STORY_SUBTITLES_DEFAULT 1
+#else
+#define STORY_SUBTITLES_DEFAULT 0
+#endif
+
 /* The toolkit's game-file redirect (kernel.h, not on this target's include path). */
 #if defined(_WIN32)
 typedef WCHAR xbox_host_char;
@@ -348,7 +359,12 @@ static int big_entries(const uint8_t *p, size_t n, size_t file_size, BigEntry **
         e[i].size = be32(p + pos + 4);
         e[i].dirpos = pos;
         memcpy(e[i].name, p + pos + 8, (size_t)(z - (p + pos + 8)));
-        if ((uint64_t)e[i].off + e[i].size > file_size) { free(e); return fail("archive entry %s runs past the end", e[i].name); }
+        if ((uint64_t)e[i].off + e[i].size > file_size) {
+            /* [android] report before freeing: the name lives in e[] (contatg 1.4 fix). */
+            fail("archive entry %s runs past the end", e[i].name);
+            free(e);
+            return 0;
+        }
         pos = (size_t)(z - p) + 1;
     }
     *out = e;
@@ -476,7 +492,7 @@ static int valid_target(const char *t)
 static int pack_load(const char *dir, const char *folder, Pack *p, int read_deltas)
 {
     char path[LANG_PATH], *line, *cursor, section[32] = "";
-    int schema = 0;
+    int schema = 0, xbe_targets = 0;
     memset(p, 0, sizeof *p);
     snprintf(p->folder, sizeof p->folder, "%s", folder);
     snprintf(path, sizeof path, "%s" HOST_SEP "language.ini", dir);
@@ -486,7 +502,7 @@ static int pack_load(const char *dir, const char *folder, Pack *p, int read_delt
     if (!text) return fail("out of memory%s", NULL);
     memcpy(text, p->ini.p, p->ini.n + 1);
     char *start = text;
-    if (!memcmp(start, "\xEF\xBB\xBF", 3)) start += 3;
+    if (p->ini.n >= 3 && !memcmp(start, "\xEF\xBB\xBF", 3)) start += 3;
     cursor = start;
     while ((line = next_token(&cursor, '\n')) != NULL) {
         line = trim(line);
@@ -514,15 +530,27 @@ static int pack_load(const char *dir, const char *folder, Pack *p, int read_delt
         } else if (!strcmp(section, "[files]")) {
             size_t vlen = strlen(value);
             if (p->count >= LANG_MAX_FILES) { free(text); return fail("%s: too many files", folder); }
-            if (!valid_target(key) || !safe_name(value, 1) || vlen < 5 || strcmp(value + vlen - 4, ".djd")) {
+            if (strlen(key) >= sizeof(p->files[0].target) || !valid_target(key) || !safe_name(value, 1) || vlen < 5 || strcmp(value + vlen - 4, ".djd")) {
+                fail("bad [files] line: %s", key);   /* key points into text: report, then free */
                 free(text);
-                return fail("bad [files] line: %s", key);
+                return 0;
+            }
+            if (!strncasecmp(key, "default.xbe", 11) && (key[11] == 0 || key[11] == '|')) {
+                if (key[11] || ++xbe_targets > 1) {
+                    fail("unsupported or duplicate XBE change: %s", key);
+                    free(text);
+                    return 0;
+                }
             }
             PackFile *f = &p->files[p->count++];
             snprintf(f->target, sizeof f->target, "%s", key);
             if (read_deltas) {
                 snprintf(path, sizeof path, "%s" HOST_SEP "%s", dir, value);
-                if (!read_file(path, &f->delta, 256u << 20)) { free(text); return fail("missing delta %s", value); }
+                if (!read_file(path, &f->delta, 256u << 20)) {
+                    fail("missing delta %s", value);
+                    free(text);
+                    return 0;
+                }
             }
         }
     }
@@ -826,7 +854,14 @@ void pc_language_start(const char *data_root, const char *game_dir)
         int seen = 0;
         split_target(g_pack.files[i].target, file, sizeof file, &rest);
         for (int j = 0; j < nfiles; j++) seen |= same_file_name(files[j], file);
-        if (!seen && _stricmp(file, "default.xbe") && nfiles < 16) snprintf(files[nfiles++], sizeof files[0], "%s", file);
+        if (!seen && _stricmp(file, "default.xbe")) {
+            if (nfiles >= 16) {
+                fprintf(stderr, "[LANG] language pack '%s' not used: more than 16 game files\n", folder);
+                pack_free(&g_pack);
+                return;
+            }
+            snprintf(files[nfiles++], sizeof files[0], "%s", file);
+        }
     }
 
     /* The cache is valid while the pack and the dump files it reads are unchanged. */
@@ -881,7 +916,8 @@ void pc_language_start(const char *data_root, const char *game_dir)
             snprintf(out, sizeof out, "%s" HOST_SEP "%s", cache, files[j]);
             g_error[0] = 0;
             if (!find_in(game_dir, files[j], source, sizeof source)) fail("%s is not in the game folder", files[j]);
-            if (!g_error[0]) rebuild_file(source, out, edits, k);
+            if (!g_error[0] && !rebuild_file(source, out, edits, k) && !g_error[0])
+                fail("could not rebuild %s", source);
             if (g_error[0]) {
                 fprintf(stderr, "[LANG] language pack '%s' not used: %s\n", folder, g_error);
                 pack_free(&g_pack);
@@ -929,11 +965,23 @@ void pc_language_patch_xbe(void *xbe, size_t size)
         if (!delta_apply(f->delta.p, f->delta.n, image, size, &out, "default.xbe") || out.n != size) {
             fprintf(stderr, "[LANG] default.xbe change not applied: %s\n", g_error[0] ? g_error : "size differs");
             free(out.p);
+            /* [android] contatg 1.4: a pack whose XBE half failed is switched off whole. */
+            g_xbox_game_file_redirect = NULL; g_active = 0; g_pack_subtitles = 0;
             return;
         }
         /* Only the data sections: the code was lifted ahead of time, so a change there would
          * not run, and the loaded image must keep matching the lifted code. */
+        if (size < 0x124) {
+            fprintf(stderr, "[LANG] default.xbe change not applied: truncated header\n");
+            free(out.p); g_xbox_game_file_redirect = NULL; g_active = 0; g_pack_subtitles = 0;
+            return;
+        }
         uint32_t base = le32(image + 0x104), nsec = le32(image + 0x11C), hdr = le32(image + 0x120) - base;
+        if ((uint64_t)hdr + (uint64_t)nsec * 56 > size || nsec > 1024) {
+            fprintf(stderr, "[LANG] default.xbe change not applied: invalid section table\n");
+            free(out.p); g_xbox_game_file_redirect = NULL; g_active = 0; g_pack_subtitles = 0;
+            return;
+        }
         size_t changed = 0;
         for (size_t at = 0; at < size; at++) {
             if (image[at] == out.p[at]) continue;
@@ -942,13 +990,15 @@ void pc_language_patch_xbe(void *xbe, size_t size)
                 const uint8_t *h = image + hdr + s * 56;
                 uint32_t raw = le32(h + 12), raw_size = le32(h + 16), name = le32(h + 20) - base;
                 for (size_t a = 0; a < 2 && name < size; a++)
-                    if (!strncmp((const char *)image + name, allowed[a], strlen(allowed[a]) + 1) &&
+                    if ((size_t)name + strlen(allowed[a]) + 1 <= size &&
+                        !strncmp((const char *)image + name, allowed[a], strlen(allowed[a]) + 1) &&
                         at >= raw && at < (size_t)raw + raw_size)
                         ok = 1;
             }
             if (!ok) {
                 fprintf(stderr, "[LANG] default.xbe change not applied: byte 0x%zX is outside .rdata/.data\n", at);
                 free(out.p);
+                g_xbox_game_file_redirect = NULL; g_active = 0; g_pack_subtitles = 0;
                 return;
             }
             changed++;
@@ -961,7 +1011,7 @@ void pc_language_patch_xbe(void *xbe, size_t size)
 
 int pc_language_all_subtitles(void)
 {
-    int choice = recomp_settings_get("language", "story_subtitles", 0);
+    int choice = recomp_settings_get("language", "story_subtitles", STORY_SUBTITLES_DEFAULT);
     if (choice == 1) return 1;
     if (choice == 2) return 0;
     return g_active && g_pack_subtitles;

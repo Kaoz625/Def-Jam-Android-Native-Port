@@ -20,4 +20,8 @@ void defjam_test_generator_seed(uint32_t generator, uint32_t stack);
 void defjam_test_logic_seed(uint32_t self, uint32_t stack);
 void defjam_test_draw(uint32_t generator, uint32_t caller);
 void defjam_test_crowd_update(void);
+long long defjam_test_current_step(void);
+void defjam_test_set_step(long long step);
+unsigned long long defjam_test_step_hash(long long step);
+
 #endif

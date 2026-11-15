@@ -31,6 +31,9 @@
 
 #include <SDL3/SDL.h>
 #include <time.h>
+#if defined(__ANDROID__)
+#include "platform/android_sched.h"   /* [android] defjam_monitor_audio (src/hooks/android_monitor.c) */
+#endif
 
 #define SDLA_SAMPLE_RATE   48000
 #define SDLA_CHANNELS      2
@@ -84,6 +87,22 @@ int xa2_init(void)
                             SDLA_BUF_SAMPLES_MIN, SDLA_BUF_SAMPLES_MAX);
     g_num_bufs = env_int("RECOMP_AUDIO_BUF_COUNT", SDLA_NUM_BUFS_DEFAULT,
                          SDLA_NUM_BUFS_MIN, SDLA_NUM_BUFS_MAX);
+#if defined(__ANDROID__)
+    /* [android] contatg's launcher sets DEFJAM_AUDIO_BUFFER_MS ([vksched] audio_buffer_ms,
+     * 43..85, default 60), which on 1.4 sized the old ring's preroll. Here the queue the
+     * frame thread is paced to is g_num_bufs device buffers, so the same latency is asked
+     * as a buffer count (an explicit RECOMP_AUDIO_BUF_COUNT still wins). */
+    if (!getenv("RECOMP_AUDIO_BUF_COUNT")) {
+        const char *ms_env = getenv("DEFJAM_AUDIO_BUFFER_MS");
+        int ms = ms_env ? atoi(ms_env) : 60;
+        if (ms < 43) ms = 43;
+        if (ms > 85) ms = 85;
+        g_num_bufs = (ms * (SDLA_SAMPLE_RATE / 1000) + g_buf_samples - 1) / g_buf_samples;
+        if (g_num_bufs < SDLA_NUM_BUFS_MIN) g_num_bufs = SDLA_NUM_BUFS_MIN;
+        if (g_num_bufs > SDLA_NUM_BUFS_MAX) g_num_bufs = SDLA_NUM_BUFS_MAX;
+        fprintf(stderr, "[AUDIO121] audio_buffer_ms=%d -> %d x %d-sample buffers\n", ms, g_num_bufs, g_buf_samples);
+    }
+#endif
 
     /* Headless: no speakers unless the caller names a driver. */
     e = getenv("RECOMP_HEADLESS");
@@ -179,6 +198,12 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     }
     g_frames_written++;
     g_samples_queued += (uint64_t)num_samples;
+#if defined(__ANDROID__)
+    {   /* [android] the 1 Hz monitor's audio line: queue depth and dry spells (no refusals here) */
+        int q = SDL_GetAudioStreamQueued(g_stream);
+        defjam_monitor_audio(q > 0 ? (unsigned)(q / SDLA_FRAME_BYTES) : 0u, g_underruns, 0u, 0u);
+    }
+#endif
     return 1;
 }
 

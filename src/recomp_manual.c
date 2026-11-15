@@ -23,6 +23,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include "host.h"
+#if defined(__ANDROID__)
+#include "../tools/xboxrecomp/src/kernel/android_gpu_wait.h"
+#endif
 
 /* The generated register model: MEM8/16/32, XBOX_PTR, and the guest registers
  * declared RECOMP_TLS. Declaring them here by hand instead would resolve to
@@ -31,6 +34,9 @@
 #include "recomp/gen/recomp_types.h"
 #include "hooks/save_compat.h"
 #include "hooks/test_observations.h"
+#if defined(__ANDROID__)
+#include "hooks/rollback.h"
+#endif
 #include "hooks/recorder.h"
 #include "hooks/input_latency.h"
 #include "hooks/input_consumption.h"
@@ -45,6 +51,11 @@
 #include "patches/options_volume.h"
 #include "patches/menu_geometry.h"
 #include "patches/cinema_timing.h"
+#if defined(__ANDROID__)
+#include "hooks/netplay.h"
+#include "hooks/automatch.h"
+#include "hooks/android_netplay.h"
+#endif
 
 /* Crowd test controls (src/hooks/crowd_control.c, RECOMP_TEST_CROWD; off unless set). */
 void defjam_crowd_match_start(void);
@@ -91,6 +102,12 @@ void sub_00087700_enter(void)
 {
     defjam_crowd_step();
     defjam_test_step();
+#if defined(__ANDROID__)
+    /* [android] FFNY-style rollback/netplay (src/hooks/netplay.c): a replayed step ends here. */
+    if(netplay_replaying131()){netplay_on_step();return;}
+    if(netplay_active())android_netplay_profile_step();
+    else if(netplay_verifying131())netplay_on_step();
+#endif
     s_ws_hud_live = 1;
     ws_hud_heartbeat();
     cheats_fight_step();        /* [cheats] fight cheats (src/patches/cheats.c) */
@@ -111,7 +128,11 @@ void sub_0008BE60_enter(void)
  * through a pause that began in a live fight (issue #95); otherwise no change. */
 void sub_00079B60_enter(void) { if (s_ws_hud_live) ws_hud_heartbeat(); }
 void sub_0007A8F0_enter(void) { if (s_ws_hud_live) ws_hud_heartbeat(); }
-void sub_001A4D90_enter(void) { defjam_test_match_start(); defjam_crowd_match_start(); cheats_match_start(); song_cursor_match_start(); }
+void sub_001A4D90_enter(void) { defjam_test_match_start(); defjam_crowd_match_start(); cheats_match_start(); song_cursor_match_start();
+#if defined(__ANDROID__)
+    if(netplay_active()||netplay_verifying131())netplay_on_match_start();
+#endif
+}
 /* Widescreen song notification (src/patches/widescreen.c, issue #118): the APT
  * movie loader (archive, name, &apt, &const), and the next step of the load,
  * which its only caller runs straight after it with the .apt data as its second
@@ -162,10 +183,22 @@ void sub_0005AF80(void)
     }
     sub_0005AF80_gen();
 }
-void sub_001BC690_enter(void) { defjam_test_rng(g_esp); }
-void sub_001AD220_enter(void) { defjam_test_ai_seed(g_esp); }
+void sub_001BC690_enter(void) { defjam_test_rng(g_esp);
+#if defined(__ANDROID__)
+    if (netplay_active()) netplay_on_seed(g_esp,2,0x1BC690u);
+#endif
+}
+void sub_001AD220_enter(void) { defjam_test_ai_seed(g_esp);
+#if defined(__ANDROID__)
+    if (netplay_active()) netplay_on_seed(g_esp,1,0x1AD220u);
+#endif
+}
 /* The seeding routine every generator of this kind goes through (thiscall). */
-void sub_000AA0D0_enter(void) { defjam_test_generator_seed(g_ecx, g_esp); defjam_crowd_seed(g_ecx, g_esp); }
+void sub_000AA0D0_enter(void) { defjam_test_generator_seed(g_ecx, g_esp); defjam_crowd_seed(g_ecx, g_esp);
+#if defined(__ANDROID__)
+    if (netplay_active()) netplay_on_seed(g_esp,2,g_ecx);
+#endif
+}
 void sub_000C8820_enter(void) { defjam_test_logic_seed(g_ecx, g_esp); }
 /* Every draw (RECOMP_TEST_DRAWS): the C runtime's rand, the match generator, and the two
  * wrappers the object-form generators are drawn through; then the background crowd's update. */
@@ -181,7 +214,11 @@ void sub_00073FD0_enter(void) { scene_launcher_loader_enter(); }
 void sub_0002DFF0_enter(void) { scene_launcher_mode_enter(); }
 /* The developer run module, rebuilt from the host (src/hooks/dev_module.c): the manager's tick
  * queues it on request; its methods are traced. RECOMP_DEV_MODULE; off unless set. */
-void sub_00077040_enter(void) { dev_module_manager_enter(); cheats_game_tick(); song_cursor_game_tick(); }  /* + Story cheats, src/patches/cheats.c; song shortcuts, src/patches/song_cursor.c */
+void sub_00077040_enter(void) { dev_module_manager_enter(); cheats_game_tick(); song_cursor_game_tick();
+#if defined(__ANDROID__)
+    if(!netplay_replaying131())automatch_android_tick();
+#endif
+}  /* + Story cheats, src/patches/cheats.c; song shortcuts, src/patches/song_cursor.c */
 void sub_00077C40_enter(void) { dev_module_trace(1); }
 void sub_00077A40_enter(void) { dev_module_trace(3); }
 void sub_00077B20_enter(void) { dev_module_trace(4); }
@@ -192,7 +229,11 @@ extern void sub_000766B0_gen(void);
 void sub_000766B0(void) { defjam_cinema_render(sub_000766B0_gen); }
 void sub_00077DD0_enter(void) { dev_module_trace(7); }
 /* The per-fighter pad reader: RECOMP_TEST_INPUT replaces what it is about to read. */
-void sub_001BAA00_enter(void) { defjam_test_input(MEM32(g_esp + 4)); }
+void sub_001BAA00_enter(void) { defjam_test_input(MEM32(g_esp + 4));
+#if defined(__ANDROID__)
+    if(netplay_active()||netplay_verifying131())netplay_on_pad_read(MEM32(g_esp+4));
+#endif
+}
 /* Observe both sides of the calibrated fighter pad-consumption routine.
  * v0.16's manual dispatch sends direct calls through this wrapper too. */
 extern void sub_001BAA00_gen(void);
@@ -911,6 +952,9 @@ static void funccall_hook(void)
     /* RECOMP_FE_INJECT: commands of a test's own, after a chosen call (src/hooks/fe_inject.c). */
     fe_inject_after_call(text);
     dev_module_after_call(text);
+#if defined(__ANDROID__)
+    automatch_on_funccall(text);
+#endif
 }
 
 /* ---- Trace chosen functions, by guest address --------------------------
@@ -1053,6 +1097,23 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
     if (xbox_va == 0x0002D9E0u && input_latency_on()) return sub_0002D9E0;
     if (xbox_va == 0x00079280u && input_latency_on()) return sub_00079280;
     if (xbox_va == 0x00079FA0u && input_latency_on()) return sub_00079FA0;
+#if defined(__ANDROID__)
+    /* Audio/mixer wrappers always call the original when rollback is OFF. */
+    if(xbox_va==0x00137010u)return netplay_sound_command;
+    void *sound_handler131=netplay_sound_handler(xbox_va);
+    if(sound_handler131)return (recomp_func_t)sound_handler131;
+    if(xbox_va==0x0001DC10u)return rollback_sound_alloc;
+    if(xbox_va==0x0001DC20u)return rollback_sound_free;
+    if(xbox_va==0x0002A180u)return rollback_heap_free;
+    if(xbox_va==0x0011FCC0u)return rollback_mixer_lock_a;
+    if(xbox_va==0x00121C80u)return rollback_mixer_lock_b;
+    if(xbox_va==0x0011FCD0u)return rollback_mixer_unlock_a;
+    if(xbox_va==0x00121C90u)return rollback_mixer_unlock_b;
+    if (netplay_active()) {
+        if (xbox_va==0x00081170u) return netplay_crowd_update;
+        if (xbox_va==0x000D6670u) { extern void android_netplay_help(void); return android_netplay_help; }
+    }
+#endif
     if (xbox_va == 0x0012C310u && getenv("RECOMP_TRACE_VOICE"))
         return trace_voice_render;
     /* This hook sees indirect calls only, so it suits a trace wrapper or a
@@ -1278,8 +1339,14 @@ void sub_0021EB90_enter(void)
     if (sem < 0x10000u || (uint32_t)(MEM32(dev + 0x2C) - MEM32(sem)) < 16u)
         return;
     QueryPerformanceCounter(&t0);
+    t1 = t0;
     for (;;) {
+#if defined(__ANDROID__)
+        android_gpu_wait_pause((uint64_t)(t1.QuadPart - t0.QuadPart)
+                               * 1000000000ull / (uint64_t)freq.QuadPart);
+#else
         SwitchToThread();
+#endif
         if ((uint32_t)(MEM32(dev + 0x2C) - MEM32(sem)) < 16u)
             break;
         QueryPerformanceCounter(&t1);

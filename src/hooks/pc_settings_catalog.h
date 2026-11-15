@@ -14,7 +14,12 @@ extern "C" {
 
 /* Room for the whole catalogue: the display table plus the input (64), launcher/overlay (16)
  * debug (16), language (4) and cheats (8) tables. */
+#if defined(__ANDROID__)
+/* [android] plus about 60 Android graphics/scheduler keys (pc_settings_catalog.c). */
+#define PC_SETTINGS_MAX 240
+#else
 #define PC_SETTINGS_MAX 160
+#endif
 
 /* A four-fighter match holds about 2 GiB of replacements. At 512 MiB the cache evicted and
  * re-decoded dozens of textures every two seconds in a fight on the Steam Deck. */

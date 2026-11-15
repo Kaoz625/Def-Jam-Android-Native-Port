@@ -136,6 +136,9 @@ void d3d8_set_texture_anisotropy(unsigned max);
  * so call it before the device starts; later calls apply at the next start. */
 void d3d8_set_msaa(unsigned samples);
 
+/* Recent Vulkan presentation rate, sampled over roughly two seconds. */
+float d3d8_present_fps(void);
+
 /* A host program's drawing on top of the picture, in window pixels, after the
  * title's target has been scaled into the window: a menu, an on-screen display.
  * It runs on the thread that presents, on the immediate context (the pointers are Direct3D 11 interfaces; plain

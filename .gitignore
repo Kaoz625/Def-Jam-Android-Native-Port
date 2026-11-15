@@ -17,6 +17,10 @@ extracted/
 # ---- build output ----
 build/
 out/
+android/.gradle/
+android/app/build/
+android/vendor/*
+!android/vendor/.gitkeep
 cmake-build-*/
 *.obj
 *.o
@@ -75,3 +79,21 @@ CLAUDE.local.md
 *.local.json
 *.local.md
 /config/menu-ui-*.json
+
+# Android loader source snapshots (licenses kept; no built libraries)
+!android/vendor/volk/
+!android/vendor/volk/**
+!android/vendor/libadrenotools/
+!android/vendor/libadrenotools/**
+!android/vendor/THIRD-PARTY-NOTICES.txt
+
+# Local Android configuration, signing and install outputs
+local.properties
+key.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+.cxx/
+/save/
+.env

@@ -19,6 +19,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "platform/android_hitch.h"
 #include "apu_state.h"
 #ifndef _WIN32
 #include <unistd.h>
@@ -1408,6 +1409,10 @@ static void apu_irq_stats_line(void)
 
 static void *mcpx_apu_frame_thread(void *arg)
 {
+#if defined(__ANDROID__)
+    extern void defjam_android_native_thread_enter(const char *,const char *,uintptr_t);
+    defjam_android_native_thread_enter("audio-mix","mcpx_apu_frame_thread",(uintptr_t)mcpx_apu_frame_thread);
+#endif
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
 #if defined(__APPLE__)
     /* Guest threads run at user-interactive QoS on Darwin (win32_compat.c, so the title's
@@ -1435,6 +1440,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
         int div0 = d->ep_frame_div;
+        unsigned audio123=dj_trace(DJ_AUDIO);
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
          * whatever the front end is doing. Tying it to se_frame stopped it
@@ -1524,6 +1530,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * thread starved there indefinitely: Burnout 3 froze on its vehicle
          * select, blocked in voice_lock at raised IRQL, which in turn held
          * off every USB interrupt. */
+        dj_trace_end(audio123);
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
