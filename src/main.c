@@ -1100,6 +1100,23 @@ __attribute__((visibility("default"))) int SDL_main(int argc, char **argv)
 int main(int argc, char **argv)
 #endif
 {
+#if defined(__ANDROID__)
+    {   /* [blz] Test switches: /storage/emulated/0/DefJamFFNY/env.txt, NAME=VALUE a line
+         * (# comments), e.g. the desktop harness's RECOMP_PAD_SCRIPT for a scripted fight. */
+        FILE *f = fopen("/storage/emulated/0/DefJamFFNY/env.txt", "r");
+        if (f) {
+            static char line[16384];
+            while (fgets(line, sizeof line, f)) {
+                char *eq = strchr(line, '='), *end = line + strlen(line);
+                while (end > line && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
+                if (line[0] == '#' || !eq || eq == line) continue;
+                *eq = 0;
+                setenv(line, eq + 1, 1);
+            }
+            fclose(f);
+        }
+    }
+#endif
 #if defined(_WIN32)
     (void)argc;
     (void)argv;
