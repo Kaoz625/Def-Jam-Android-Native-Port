@@ -3,6 +3,13 @@ plugins {
 }
 
 def vendor = file("../vendor")
+// [android] Bound parallel compiles inside the CMake build (each lifted file takes GBs of
+// RAM): android/dell-build.sh passes -PdefjamNativeJobs; unset keeps Ninja's default.
+def defjamCmakeArgs = ["-DANDROID_STL=c++_shared", "-DDEFJAM_BUILD_GAME=ON"]
+if (project.findProperty("defjamNativeJobs")) {
+    defjamCmakeArgs += ["-DCMAKE_JOB_POOLS=compile=" + project.findProperty("defjamNativeJobs"),
+                        "-DCMAKE_JOB_POOL_COMPILE=compile"]
+}
 
 android {
     namespace "org.defjamffny.android"
@@ -14,12 +21,12 @@ android {
         applicationId "org.defjamffny.android"
         minSdk 29
         targetSdk 34
-        versionCode 148
-        versionName "1.4"
+        versionCode 149
+        versionName "1.4-up1.1.2"
         ndk { abiFilters "arm64-v8a" }
         externalNativeBuild {
             cmake {
-                arguments "-DANDROID_STL=c++_shared", "-DDEFJAM_BUILD_GAME=ON"
+                arguments(*defjamCmakeArgs)
                 cFlags "-O2"
                 cppFlags "-O2"
                 targets "main", "SDL3-shared", "main_hook", "hook_impl", "defjam_fg34", "defjam_lsfg27"
