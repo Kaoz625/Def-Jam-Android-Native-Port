@@ -1,4 +1,12 @@
 #define _CRT_SECURE_NO_WARNINGS
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2,34)
+#define DEFJAM_GLIBC_234 1
+#endif
+#endif
+#ifndef DEFJAM_GLIBC_234
+#define DEFJAM_GLIBC_234 0
+#endif
 #include "pc_mods.h"
 #include "pc_settings.h"
 #include "recomp_settings.h"
@@ -172,7 +180,7 @@ bool mod_start(const std::string &requested, const std::string &id) {
     posix_spawn_file_actions_t files; posix_spawn_file_actions_init(&files);
 #if defined(__APPLE__)
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
-#elif defined(__GLIBC__) && __GLIBC_PREREQ(2,34)
+#elif defined(__GLIBC__) && !defined(__ANDROID__) && DEFJAM_GLIBC_234
     posix_spawn_file_actions_addclosefrom_np(&files,3);
 #else
     long limit = sysconf(_SC_OPEN_MAX); if (limit < 0) limit = 1024;
